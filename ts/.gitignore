@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+
+# Build output (kept in dist/)
+dist/
+
+# Stale compiled files in src/ (build targets dist/, not src/)
+src/**/*.js
+src/**/*.d.ts
+
+# Source maps - should not be committed
+# These are generated build artifacts that expose source code details
+*.js.map
+*.d.ts.map
+
+# TypeScript build info
+*.tsbuildinfo
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test coverage
+coverage/

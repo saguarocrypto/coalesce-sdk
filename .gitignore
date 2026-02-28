@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+.venv/
+
+# Build outputs
+dist/
+target/
+*.egg-info/
+
+# Caches
+.ruff_cache/
+.pytest_cache/
+__pycache__/
+.turbo/
+*.tsbuildinfo
+
+# Coverage
+coverage/
+
+# OS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/

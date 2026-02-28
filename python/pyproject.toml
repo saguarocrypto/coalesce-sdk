@@ -1,0 +1,64 @@
+[project]
+name = "coalescefi-sdk"
+version = "0.1.0"
+description = "Python SDK for the CoalesceFi lending protocol on Solana"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+authors = [
+    { name = "CoalesceFi", email = "dev@coalescefi.com" }
+]
+keywords = ["solana", "defi", "lending", "coalescefi", "blockchain"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "solana>=0.35.0",
+    "solders>=0.21.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "mypy>=1.8.0",
+    "ruff>=0.2.0",
+    "ty>=0.0.1",
+]
+
+[project.urls]
+Homepage = "https://coalescefi.com"
+Repository = "https://github.com/saguarocrypto/coalesce-sdk"
+Documentation = "https://docs.coalescefi.com"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/coalescefi_sdk"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B", "C4", "SIM"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_return_any = true
+warn_unused_ignores = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
