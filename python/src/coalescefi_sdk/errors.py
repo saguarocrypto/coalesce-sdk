@@ -88,9 +88,10 @@ class CoalescefiErrorCode(IntEnum):
     FeesNotCollected = 39  # ERR-040: Protocol fees not collected
     NoExcessToWithdraw = 40  # ERR-041: No excess in vault
 
-    # OPERATIONAL ERRORS (41-42)
+    # OPERATIONAL ERRORS (41-43)
     MathOverflow = 41  # ERR-042: Arithmetic overflow
     PayoutBelowMinimum = 42  # ERR-043: Slippage protection triggered
+    NoHaircutToClaim = 43  # ERR-044: No haircut recovery available
 
 
 # =============================================================================
@@ -149,6 +150,7 @@ ERROR_MESSAGES: dict[CoalescefiErrorCode, str] = {
     # Operational errors
     CoalescefiErrorCode.MathOverflow: "Mathematical overflow or underflow",
     CoalescefiErrorCode.PayoutBelowMinimum: "Payout is below the minimum specified (slippage protection triggered)",
+    CoalescefiErrorCode.NoHaircutToClaim: "No haircut recovery available to claim",
 }
 
 
@@ -178,9 +180,9 @@ ERROR_RECOVERY_ACTIONS: dict[CoalescefiErrorCode, str] = {
     CoalescefiErrorCode.NotMatured: "Wait until the market maturity date to withdraw funds",
     CoalescefiErrorCode.MarketMatured: "Market has matured - deposits and borrows are no longer allowed",
     CoalescefiErrorCode.SettlementGracePeriod: "Wait 5 minutes after maturity for the settlement grace period to elapse",
-    CoalescefiErrorCode.NotSettled: "Market must be settled first - call withdraw to trigger settlement",
+    CoalescefiErrorCode.NotSettled: "Market must be settled first - call withdraw or force-close to trigger settlement",
     CoalescefiErrorCode.SettlementNotImproved: "New settlement must be better than current - ensure more funds were added to vault",
-    CoalescefiErrorCode.SettlementNotComplete: "Settlement has not occurred yet - wait for first withdrawal after maturity",
+    CoalescefiErrorCode.SettlementNotComplete: "Settlement has not occurred yet - wait for first withdrawal or force-close after maturity (must be after the 5-minute grace period)",
     # Authorization errors (need different permissions)
     CoalescefiErrorCode.Unauthorized: "This operation requires admin or whitelist manager authority",
     CoalescefiErrorCode.NotWhitelisted: "Contact the whitelist manager to request borrowing access",
@@ -210,6 +212,7 @@ ERROR_RECOVERY_ACTIONS: dict[CoalescefiErrorCode, str] = {
     CoalescefiErrorCode.InvalidTimestamp: "Invalid timestamp detected - this may indicate clock skew, please retry",
     CoalescefiErrorCode.RepaymentExceedsDebt: "Reduce repayment amount to match or be less than the outstanding debt",
     CoalescefiErrorCode.BorrowerHasActiveDebt: "Borrower must repay all outstanding debt before being blacklisted",
+    CoalescefiErrorCode.NoHaircutToClaim: "No haircut recovery is available - the market may not have experienced a haircut or your share has already been claimed",
 }
 
 

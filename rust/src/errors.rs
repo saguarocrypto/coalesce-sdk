@@ -215,6 +215,10 @@ pub enum CoalescefiError {
     /// ERR-043: Slippage protection triggered
     #[error("Payout is below the minimum specified (slippage protection triggered)")]
     PayoutBelowMinimum = 42,
+
+    /// ERR-044: No haircut to claim
+    #[error("No haircut recovery owed to this lender")]
+    NoHaircutToClaim = 43,
 }
 
 impl CoalescefiError {
@@ -269,6 +273,7 @@ impl CoalescefiError {
             40 => Some(Self::NoExcessToWithdraw),
             41 => Some(Self::MathOverflow),
             42 => Some(Self::PayoutBelowMinimum),
+            43 => Some(Self::NoHaircutToClaim),
             _ => None,
         }
     }
@@ -319,6 +324,7 @@ impl CoalescefiError {
             Self::NoExcessToWithdraw => "NoExcessToWithdraw",
             Self::MathOverflow => "MathOverflow",
             Self::PayoutBelowMinimum => "PayoutBelowMinimum",
+            Self::NoHaircutToClaim => "NoHaircutToClaim",
         }
     }
 
@@ -382,7 +388,7 @@ impl CoalescefiError {
                 Some("Wait 5 minutes after maturity for the settlement grace period to elapse")
             }
             Self::NotSettled => {
-                Some("Market must be settled first - call withdraw to trigger settlement")
+                Some("Market must be settled first - call withdraw or force-close to trigger settlement")
             }
             Self::SettlementNotImproved => {
                 Some("New settlement must be better than current - ensure more funds were added to vault")
@@ -422,7 +428,9 @@ impl CoalescefiError {
             Self::BorrowerHasActiveDebt => {
                 Some("Borrower must repay all outstanding debt before being blacklisted")
             }
-            // All other errors have no specific user recovery action.
+            Self::NoHaircutToClaim => {
+                Some("No haircut recovery is owed to this lender position")
+            }
             _ => None,
         }
     }
@@ -576,18 +584,28 @@ mod tests {
 
     #[test]
     fn test_error_code_roundtrip() {
-        for code in 0..=42u32 {
+        for code in 0..=43u32 {
             let error = CoalescefiError::from_code(code).unwrap();
             assert_eq!(error.code(), code);
         }
-        assert!(CoalescefiError::from_code(43).is_none());
+        assert!(CoalescefiError::from_code(44).is_none());
     }
 
     #[test]
     fn test_error_names() {
-        assert_eq!(CoalescefiError::AlreadyInitialized.name(), "AlreadyInitialized");
+        assert_eq!(
+            CoalescefiError::AlreadyInitialized.name(),
+            "AlreadyInitialized"
+        );
         assert_eq!(CoalescefiError::MathOverflow.name(), "MathOverflow");
-        assert_eq!(CoalescefiError::PayoutBelowMinimum.name(), "PayoutBelowMinimum");
+        assert_eq!(
+            CoalescefiError::PayoutBelowMinimum.name(),
+            "PayoutBelowMinimum"
+        );
+        assert_eq!(
+            CoalescefiError::NoHaircutToClaim.name(),
+            "NoHaircutToClaim"
+        );
     }
 
     #[test]
@@ -653,7 +671,9 @@ mod tests {
     #[test]
     fn test_recovery_actions() {
         assert!(CoalescefiError::ZeroAmount.recovery_action().is_some());
-        assert!(CoalescefiError::InsufficientBalance.recovery_action().is_some());
+        assert!(CoalescefiError::InsufficientBalance
+            .recovery_action()
+            .is_some());
     }
 
     #[test]
@@ -679,7 +699,7 @@ mod tests {
 
     #[test]
     fn test_all_errors_have_messages() {
-        for code in 0..=42u32 {
+        for code in 0..=43u32 {
             let error = CoalescefiError::from_code(code).unwrap();
             let message = format!("{}", error);
             assert!(!message.is_empty(), "Error {} has empty message", code);
@@ -690,7 +710,10 @@ mod tests {
     fn test_category_names() {
         assert_eq!(ErrorCategory::Initialization.name(), "initialization");
         assert_eq!(ErrorCategory::Authorization.name(), "authorization");
-        assert_eq!(ErrorCategory::AccountValidation.name(), "account_validation");
+        assert_eq!(
+            ErrorCategory::AccountValidation.name(),
+            "account_validation"
+        );
         assert_eq!(ErrorCategory::InputValidation.name(), "input_validation");
         assert_eq!(ErrorCategory::Balance.name(), "balance");
         assert_eq!(ErrorCategory::MarketState.name(), "market_state");

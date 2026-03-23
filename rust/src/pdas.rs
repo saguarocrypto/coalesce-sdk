@@ -8,8 +8,8 @@ use alloc::vec::Vec;
 use solana_program::pubkey::Pubkey;
 
 use crate::constants::{
-    SEED_BLACKLIST, SEED_BORROWER_WHITELIST, SEED_LENDER, SEED_MARKET, SEED_MARKET_AUTHORITY,
-    SEED_PROTOCOL_CONFIG, SEED_VAULT,
+    SEED_BLACKLIST, SEED_BORROWER_WHITELIST, SEED_HAIRCUT_STATE, SEED_LENDER, SEED_MARKET,
+    SEED_MARKET_AUTHORITY, SEED_PROTOCOL_CONFIG, SEED_VAULT,
 };
 
 /// Result of a PDA derivation.
@@ -52,10 +52,8 @@ pub fn find_protocol_config_pda(program_id: &Pubkey) -> PdaResult {
 /// Seeds: [SEED_MARKET, borrower_pubkey, market_nonce (u64 LE)]
 pub fn find_market_pda(borrower: &Pubkey, market_nonce: u64, program_id: &Pubkey) -> PdaResult {
     let nonce_bytes = market_nonce.to_le_bytes();
-    let (address, bump) = Pubkey::find_program_address(
-        &[SEED_MARKET, borrower.as_ref(), &nonce_bytes],
-        program_id,
-    );
+    let (address, bump) =
+        Pubkey::find_program_address(&[SEED_MARKET, borrower.as_ref(), &nonce_bytes], program_id);
     PdaResult::new(address, bump)
 }
 
@@ -84,10 +82,8 @@ pub fn find_lender_position_pda(
     lender: &Pubkey,
     program_id: &Pubkey,
 ) -> PdaResult {
-    let (address, bump) = Pubkey::find_program_address(
-        &[SEED_LENDER, market.as_ref(), lender.as_ref()],
-        program_id,
-    );
+    let (address, bump) =
+        Pubkey::find_program_address(&[SEED_LENDER, market.as_ref(), lender.as_ref()], program_id);
     PdaResult::new(address, bump)
 }
 
@@ -111,6 +107,24 @@ pub fn find_blacklist_check_pda(address: &Pubkey, blacklist_program: &Pubkey) ->
     PdaResult::new(pda_address, bump)
 }
 
+/// Find a HaircutState PDA.
+///
+/// Seeds: [SEED_HAIRCUT_STATE, market_pubkey]
+pub fn find_haircut_state_pda(market: &Pubkey, program_id: &Pubkey) -> PdaResult {
+    let (address, bump) =
+        Pubkey::find_program_address(&[SEED_HAIRCUT_STATE, market.as_ref()], program_id);
+    PdaResult::new(address, bump)
+}
+
+/// Create HaircutState PDA with known bump.
+pub fn create_haircut_state_pda(
+    market: &Pubkey,
+    bump: u8,
+    program_id: &Pubkey,
+) -> Option<Pubkey> {
+    create_pda_with_bump(&[SEED_HAIRCUT_STATE, market.as_ref()], bump, program_id)
+}
+
 /// Derive all PDAs needed for creating a new market.
 ///
 /// Market PDA depends on borrower + nonce; authority and vault depend on market pubkey.
@@ -125,11 +139,7 @@ pub struct MarketPdas {
 }
 
 /// Derive all market-related PDAs.
-pub fn derive_market_pdas(
-    borrower: &Pubkey,
-    market_nonce: u64,
-    program_id: &Pubkey,
-) -> MarketPdas {
+pub fn derive_market_pdas(borrower: &Pubkey, market_nonce: u64, program_id: &Pubkey) -> MarketPdas {
     let market = find_market_pda(borrower, market_nonce, program_id);
     let market_authority = find_market_authority_pda(&market.address, program_id);
     let vault = find_vault_pda(&market.address, program_id);
@@ -206,7 +216,11 @@ pub fn create_borrower_whitelist_pda(
     bump: u8,
     program_id: &Pubkey,
 ) -> Option<Pubkey> {
-    create_pda_with_bump(&[SEED_BORROWER_WHITELIST, borrower.as_ref()], bump, program_id)
+    create_pda_with_bump(
+        &[SEED_BORROWER_WHITELIST, borrower.as_ref()],
+        bump,
+        program_id,
+    )
 }
 
 #[cfg(test)]
@@ -314,8 +328,7 @@ mod tests {
         assert_eq!(authority_recreated, Some(pdas.market_authority.address));
 
         // Verify vault PDA uses the derived market address
-        let vault_recreated =
-            create_vault_pda(&pdas.market.address, pdas.vault.bump, &program_id);
+        let vault_recreated = create_vault_pda(&pdas.market.address, pdas.vault.bump, &program_id);
         assert_eq!(vault_recreated, Some(pdas.vault.address));
     }
 
@@ -343,6 +356,18 @@ mod tests {
         let result2 = find_market_pda(&borrower, 2, &program_id);
 
         assert_ne!(result1.address, result2.address);
+    }
+
+    #[test]
+    fn test_find_haircut_state_pda() {
+        let program_id = localnet_program_id();
+        let market = test_pubkey(10);
+
+        let result = find_haircut_state_pda(&market, &program_id);
+
+        // Verify the PDA can be recreated with the bump
+        let recreated = create_haircut_state_pda(&market, result.bump, &program_id);
+        assert_eq!(recreated, Some(result.address));
     }
 
     #[test]

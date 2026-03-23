@@ -22,11 +22,13 @@ from .accounts import (
     RetryConfig,
     decode_account,
     decode_borrower_whitelist,
+    decode_haircut_state,
     decode_lender_position,
     decode_market,
     # Decoders
     decode_protocol_config,
     fetch_borrower_whitelist,
+    fetch_haircut_state,
     fetch_lender_position,
     fetch_market,
     # Fetchers
@@ -39,10 +41,12 @@ from .constants import (
     BPS,
     DEFAULT_PROGRAM_IDS,
     DISC_BORROWER_WL,
+    DISC_HAIRCUT_STATE,
     DISC_LENDER_POSITION,
     DISC_MARKET,
     # Account Discriminators
     DISC_PROTOCOL_CONFIG,
+    HAIRCUT_STATE_SIZE,
     LENDER_POSITION_SIZE,
     MARKET_SIZE,
     # Protocol Limits
@@ -60,6 +64,7 @@ from .constants import (
     SECONDS_PER_YEAR,
     SEED_BLACKLIST,
     SEED_BORROWER_WHITELIST,
+    SEED_HAIRCUT_STATE,
     SEED_LENDER,
     SEED_MARKET,
     SEED_MARKET_AUTHORITY,
@@ -84,6 +89,34 @@ from .constants import (
     get_sdk_config,
     reset_sdk_config,
     resolve_program_id,
+)
+
+# =============================================================================
+# Math
+# =============================================================================
+from .math import (
+    DAYS_PER_YEAR,
+    SECONDS_PER_DAY,
+    InterestAccrualResult,
+    MathOverflowError,
+    UtilizationRateResult,
+    calculate_apr,
+    calculate_available_vault_balance,
+    calculate_normalized_amount,
+    calculate_position_value,
+    calculate_scaled_amount,
+    calculate_settlement_payout,
+    calculate_total_supply,
+    calculate_utilization_rate,
+    calculate_utilization_rate_decimal,
+    estimate_interest_accrual,
+    estimate_value_at_maturity,
+    growth_factor_wad,
+    mul_wad,
+    pow_wad,
+    safe_divide,
+    would_overflow_u64,
+    would_overflow_u128,
 )
 
 # =============================================================================
@@ -129,10 +162,12 @@ from .idempotency import (
 # =============================================================================
 from .instructions import (
     create_borrow_instruction,
+    create_claim_haircut_instruction,
     create_close_lender_position_instruction,
     create_collect_fees_instruction,
     create_create_market_instruction,
     create_deposit_instruction,
+    create_force_claim_haircut_instruction,
     # Instruction Builders
     create_initialize_protocol_instruction,
     # Memo
@@ -149,6 +184,7 @@ from .instructions import (
     create_set_fee_config_instruction,
     create_set_pause_instruction,
     create_set_whitelist_manager_instruction,
+    create_force_close_position_instruction,
     create_withdraw_excess_instruction,
     create_withdraw_instruction,
     get_minimum_timestamp,
@@ -170,6 +206,7 @@ from .pdas import (
     derive_market_pdas,
     find_blacklist_check_pda,
     find_borrower_whitelist_pda,
+    find_haircut_state_pda,
     find_lender_position_pda,
     find_market_authority_pda,
     find_market_pda,
@@ -185,6 +222,7 @@ from .types import (
     BorrowAccounts,
     BorrowArgs,
     BorrowerWhitelist,
+    ClaimHaircutAccounts,
     CloseLenderPositionAccounts,
     CollectFeesAccounts,
     CreateMarketAccounts,
@@ -197,6 +235,7 @@ from .types import (
     InitializeProtocolAccounts,
     # Instruction Args
     InitializeProtocolArgs,
+    InstructionResult,
     LenderPosition,
     Market,
     # Account Types
@@ -219,6 +258,9 @@ from .types import (
     WithdrawAccounts,
     WithdrawArgs,
     WithdrawExcessAccounts,
+    ForceClaimHaircutAccounts,
+    ForceClosePositionAccounts,
+    HaircutState,
 )
 
 # =============================================================================
@@ -244,11 +286,35 @@ __all__ = [
     "SEED_LENDER",
     "SEED_VAULT",
     "SEED_BORROWER_WHITELIST",
+    "SEED_HAIRCUT_STATE",
     "SEED_BLACKLIST",
     # Mathematical Constants
     "WAD",
     "BPS",
     "SECONDS_PER_YEAR",
+    "SECONDS_PER_DAY",
+    "DAYS_PER_YEAR",
+    # Math Functions
+    "mul_wad",
+    "pow_wad",
+    "growth_factor_wad",
+    "calculate_scaled_amount",
+    "calculate_normalized_amount",
+    "calculate_settlement_payout",
+    "estimate_interest_accrual",
+    "calculate_position_value",
+    "calculate_apr",
+    "estimate_value_at_maturity",
+    "calculate_total_supply",
+    "calculate_available_vault_balance",
+    "calculate_utilization_rate",
+    "calculate_utilization_rate_decimal",
+    "safe_divide",
+    "would_overflow_u64",
+    "would_overflow_u128",
+    "MathOverflowError",
+    "InterestAccrualResult",
+    "UtilizationRateResult",
     # Protocol Limits
     "MAX_ANNUAL_INTEREST_BPS",
     "MAX_FEE_RATE_BPS",
@@ -260,11 +326,13 @@ __all__ = [
     "MARKET_SIZE",
     "LENDER_POSITION_SIZE",
     "BORROWER_WHITELIST_SIZE",
+    "HAIRCUT_STATE_SIZE",
     # Account Discriminators
     "DISC_PROTOCOL_CONFIG",
     "DISC_MARKET",
     "DISC_LENDER_POSITION",
     "DISC_BORROWER_WL",
+    "DISC_HAIRCUT_STATE",
     # Instruction Discriminators
     "InstructionDiscriminator",
     # Known Program Addresses
@@ -282,6 +350,7 @@ __all__ = [
     "Market",
     "LenderPosition",
     "BorrowerWhitelist",
+    "HaircutState",
     # Instruction Args
     "InitializeProtocolArgs",
     "SetFeeConfigArgs",
@@ -312,8 +381,12 @@ __all__ = [
     "SetAdminAccounts",
     "SetWhitelistManagerAccounts",
     "WithdrawExcessAccounts",
+    "ForceClosePositionAccounts",
+    "ClaimHaircutAccounts",
+    "ForceClaimHaircutAccounts",
     # Idempotency Types
     "IdempotencyOptions",
+    "InstructionResult",
     # PDAs
     "find_program_data_pda",
     "find_protocol_config_pda",
@@ -322,6 +395,7 @@ __all__ = [
     "find_vault_pda",
     "find_lender_position_pda",
     "find_borrower_whitelist_pda",
+    "find_haircut_state_pda",
     "find_blacklist_check_pda",
     "derive_market_pdas",
     "PdaWithBump",
@@ -333,12 +407,14 @@ __all__ = [
     "decode_market",
     "decode_lender_position",
     "decode_borrower_whitelist",
+    "decode_haircut_state",
     "decode_account",
     # Fetchers
     "fetch_protocol_config",
     "fetch_market",
     "fetch_lender_position",
     "fetch_borrower_whitelist",
+    "fetch_haircut_state",
     # Type Detection
     "AccountType",
     "get_account_type",
@@ -365,6 +441,9 @@ __all__ = [
     "create_re_settle_instruction",
     "create_close_lender_position_instruction",
     "create_withdraw_excess_instruction",
+    "create_force_close_position_instruction",
+    "create_claim_haircut_instruction",
+    "create_force_claim_haircut_instruction",
     "create_set_borrower_whitelist_instruction",
     "create_set_pause_instruction",
     "create_set_blacklist_mode_instruction",

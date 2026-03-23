@@ -1,12 +1,16 @@
 import { PublicKey } from '@solana/web3.js';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   getProgramId,
+  getProgramIdLazy,
+  clearProgramIdCache,
   resolveProgramId,
   configureSdk,
   resetSdkConfig,
   getSdkConfig,
+  PROGRAM_ID,
+  PROGRAM_IDS,
   DEFAULT_PROGRAM_IDS,
   WAD,
   BPS,
@@ -47,10 +51,69 @@ describe('Constants', () => {
       expect(programId).toBeInstanceOf(PublicKey);
     });
 
+    it('should export PROGRAM_IDS for all networks', () => {
+      expect(PROGRAM_IDS.mainnet).toBeInstanceOf(PublicKey);
+      expect(PROGRAM_IDS.devnet).toBeInstanceOf(PublicKey);
+      expect(PROGRAM_IDS.localnet).toBeInstanceOf(PublicKey);
+    });
+
     it('should export DEFAULT_PROGRAM_IDS with string values', () => {
       expect(typeof DEFAULT_PROGRAM_IDS.mainnet).toBe('string');
       expect(typeof DEFAULT_PROGRAM_IDS.devnet).toBe('string');
       expect(typeof DEFAULT_PROGRAM_IDS.localnet).toBe('string');
+    });
+  });
+
+  describe('PROGRAM_ID Proxy', () => {
+    it('should support toBase58() method', () => {
+      const base58 = PROGRAM_ID.toBase58();
+      expect(typeof base58).toBe('string');
+      expect(base58.length).toBeGreaterThan(0);
+    });
+
+    it('should support toString() method', () => {
+      const str = PROGRAM_ID.toString();
+      expect(typeof str).toBe('string');
+    });
+
+    it('should support toBuffer() method', () => {
+      const buffer = PROGRAM_ID.toBuffer();
+      expect(buffer).toBeInstanceOf(Buffer);
+      expect(buffer.length).toBe(32);
+    });
+
+    it('should support toBytes() method', () => {
+      const bytes = PROGRAM_ID.toBytes();
+      expect(bytes).toBeInstanceOf(Uint8Array);
+      expect(bytes.length).toBe(32);
+    });
+
+    it('should support toJSON() method', () => {
+      const json = PROGRAM_ID.toJSON();
+      expect(typeof json).toBe('string');
+    });
+
+    it('should support equals() method', () => {
+      const programId = getProgramId();
+      expect(PROGRAM_ID.equals(programId)).toBe(true);
+      expect(PROGRAM_ID.equals(SYSTEM_PROGRAM_ID)).toBe(false);
+    });
+
+    it('should support "in" operator via has trap', () => {
+      expect('toBase58' in PROGRAM_ID).toBe(true);
+      expect('nonExistentMethod' in PROGRAM_ID).toBe(false);
+    });
+
+    it('should support Object.keys via ownKeys trap', () => {
+      const keys = Reflect.ownKeys(PROGRAM_ID);
+      expect(Array.isArray(keys)).toBe(true);
+    });
+
+    it('should support getOwnPropertyDescriptor', () => {
+      const descriptor = Object.getOwnPropertyDescriptor(PROGRAM_ID, '_bn');
+      // The descriptor may or may not exist depending on the PublicKey internals
+      // but the call should not throw
+      expect(descriptor === undefined || typeof descriptor === 'object').toBe(true);
     });
   });
 
@@ -80,6 +143,24 @@ describe('Constants', () => {
       const config = getSdkConfig();
       expect(config.network).toBeUndefined();
       expect(config.programId).toBeUndefined();
+    });
+
+    it('should cache program ID via getProgramIdLazy', () => {
+      clearProgramIdCache();
+
+      const first = getProgramIdLazy();
+      const second = getProgramIdLazy();
+
+      expect(first.equals(second)).toBe(true);
+    });
+
+    it('should clear cache with clearProgramIdCache', () => {
+      const first = getProgramIdLazy();
+      clearProgramIdCache();
+      const second = getProgramIdLazy();
+
+      // Should still be equal (same resolution) but cache was cleared
+      expect(first.equals(second)).toBe(true);
     });
   });
 
@@ -111,14 +192,6 @@ describe('Constants', () => {
     it('should have correct USDC_DECIMALS', () => {
       expect(USDC_DECIMALS).toBe(6);
     });
-
-    it('should have MIN_MATURITY_DELTA', () => {
-      expect(MIN_MATURITY_DELTA).toBe(60);
-    });
-
-    it('should have SETTLEMENT_GRACE_PERIOD', () => {
-      expect(SETTLEMENT_GRACE_PERIOD).toBe(300); // 5 minutes
-    });
   });
 
   describe('Account Sizes', () => {
@@ -149,10 +222,6 @@ describe('Constants', () => {
       expect(InstructionDiscriminator.WithdrawExcess).toBe(11);
       // ACCESS CONTROL (12-16)
       expect(InstructionDiscriminator.SetBorrowerWhitelist).toBe(12);
-      expect(InstructionDiscriminator.SetPause).toBe(13);
-      expect(InstructionDiscriminator.SetBlacklistMode).toBe(14);
-      expect(InstructionDiscriminator.SetAdmin).toBe(15);
-      expect(InstructionDiscriminator.SetWhitelistManager).toBe(16);
     });
   });
 
@@ -203,6 +272,42 @@ describe('Constants', () => {
       expect(DISC_MARKET.length).toBe(8);
       expect(DISC_LENDER_POSITION.length).toBe(8);
       expect(DISC_BORROWER_WL.length).toBe(8);
+    });
+  });
+
+  describe('Protocol Limits (additional)', () => {
+    it('should have MIN_MATURITY_DELTA', () => {
+      expect(MIN_MATURITY_DELTA).toBe(60);
+    });
+
+    it('should have SETTLEMENT_GRACE_PERIOD', () => {
+      expect(SETTLEMENT_GRACE_PERIOD).toBe(300); // 5 minutes
+    });
+  });
+
+  describe('Instruction Discriminators (additional)', () => {
+    it('should have SetPause instruction', () => {
+      expect(InstructionDiscriminator.SetPause).toBe(13);
+    });
+
+    it('should have SetBlacklistMode instruction', () => {
+      expect(InstructionDiscriminator.SetBlacklistMode).toBe(14);
+    });
+
+    it('should have SetAdmin instruction', () => {
+      expect(InstructionDiscriminator.SetAdmin).toBe(15);
+    });
+
+    it('should have SetWhitelistManager instruction', () => {
+      expect(InstructionDiscriminator.SetWhitelistManager).toBe(16);
+    });
+
+    it('should have RepayInterest instruction', () => {
+      expect(InstructionDiscriminator.RepayInterest).toBe(6);
+    });
+
+    it('should have WithdrawExcess instruction', () => {
+      expect(InstructionDiscriminator.WithdrawExcess).toBe(11);
     });
   });
 });

@@ -110,6 +110,7 @@ class WithdrawAccountsDict(TypedDict):
     blacklist_check: Pubkey
     protocol_config: Pubkey
     token_program: Pubkey
+    haircut_state: Pubkey
 
 
 class CollectFeesAccountsDict(TypedDict):
@@ -134,6 +135,7 @@ class ReSettleAccountsDict(TypedDict):
     market: Pubkey
     vault: Pubkey
     protocol_config: Pubkey
+    haircut_state: Pubkey
 
 
 class SetBorrowerWhitelistAccountsDict(TypedDict):
@@ -174,6 +176,44 @@ class WithdrawExcessAccountsDict(TypedDict):
     market_authority: Pubkey
     token_program: Pubkey
     protocol_config: Pubkey
+    blacklist_check: Pubkey
+    borrower_whitelist: Pubkey
+
+
+class ForceClosePositionAccountsDict(TypedDict):
+    market: Pubkey
+    borrower: Pubkey
+    lender_position: Pubkey
+    vault: Pubkey
+    escrow_token_account: Pubkey
+    market_authority: Pubkey
+    protocol_config: Pubkey
+    token_program: Pubkey
+    haircut_state: Pubkey
+
+
+class ClaimHaircutAccountsDict(TypedDict):
+    market: Pubkey
+    lender: Pubkey
+    lender_token_account: Pubkey
+    vault: Pubkey
+    lender_position: Pubkey
+    market_authority: Pubkey
+    haircut_state: Pubkey
+    protocol_config: Pubkey
+    token_program: Pubkey
+
+
+class ForceClaimHaircutAccountsDict(TypedDict):
+    market: Pubkey
+    borrower: Pubkey
+    lender_position: Pubkey
+    vault: Pubkey
+    escrow_token_account: Pubkey
+    market_authority: Pubkey
+    haircut_state: Pubkey
+    protocol_config: Pubkey
+    token_program: Pubkey
 
 
 class InitializeProtocolArgsDict(TypedDict):
@@ -670,7 +710,7 @@ def create_withdraw_instruction(
 
     On-chain account order:
     [market, lender, lender_token, vault, lender_position, market_authority,
-     blacklist_check, protocol_config, token_program]
+     blacklist_check, protocol_config, token_program, haircut_state]
 
     Data layout: [scaled_amount(16 bytes, u128), min_payout(8 bytes, u64)]
 
@@ -713,6 +753,7 @@ def create_withdraw_instruction(
             AccountMeta(pubkey=accounts["blacklist_check"], is_signer=False, is_writable=False),
             AccountMeta(pubkey=accounts["protocol_config"], is_signer=False, is_writable=False),
             AccountMeta(pubkey=accounts["token_program"], is_signer=False, is_writable=False),
+            AccountMeta(pubkey=accounts["haircut_state"], is_signer=False, is_writable=True),
         ],
         data=data,
     )
@@ -765,7 +806,7 @@ def create_re_settle_instruction(
     Create ReSettle instruction.
     Discriminator: 9
 
-    On-chain account order: [market, vault, protocol_config]
+    On-chain account order: [market, vault, protocol_config, haircut_state]
     Data layout: [discriminator only] - permissionless, no args
 
     SECURITY NOTE: ReSettle requires protocol_config to ensure proper
@@ -790,6 +831,7 @@ def create_re_settle_instruction(
             AccountMeta(pubkey=accounts["market"], is_signer=False, is_writable=True),
             AccountMeta(pubkey=accounts["vault"], is_signer=False, is_writable=False),
             AccountMeta(pubkey=accounts["protocol_config"], is_signer=False, is_writable=False),
+            AccountMeta(pubkey=accounts["haircut_state"], is_signer=False, is_writable=True),
         ],
         data=data,
     )
@@ -841,7 +883,8 @@ def create_withdraw_excess_instruction(
     Only the market's borrower can call this instruction.
 
     On-chain account order:
-    [market, borrower, borrower_token, vault, market_authority, token_program, protocol_config]
+    [market, borrower, borrower_token, vault, market_authority, token_program,
+     protocol_config, blacklist_check, borrower_whitelist]
 
     Data layout: [discriminator only]
 
@@ -867,6 +910,10 @@ def create_withdraw_excess_instruction(
             AccountMeta(pubkey=accounts["market_authority"], is_signer=False, is_writable=False),
             AccountMeta(pubkey=accounts["token_program"], is_signer=False, is_writable=False),
             AccountMeta(pubkey=accounts["protocol_config"], is_signer=False, is_writable=False),
+            AccountMeta(pubkey=accounts["blacklist_check"], is_signer=False, is_writable=False),
+            AccountMeta(
+                pubkey=accounts["borrower_whitelist"], is_signer=False, is_writable=False
+            ),
         ],
         data=data,
     )
@@ -1050,6 +1097,141 @@ def create_set_whitelist_manager_instruction(
             AccountMeta(
                 pubkey=accounts["new_whitelist_manager"], is_signer=False, is_writable=False
             ),
+        ],
+        data=data,
+    )
+
+
+def create_force_close_position_instruction(
+    accounts: ForceClosePositionAccountsDict,
+    program_id: Pubkey | None = None,
+) -> Instruction:
+    """
+    Create ForceClosePosition instruction.
+    Discriminator: 18
+
+    Allows the borrower to force-close a lender position after maturity,
+    transferring the lender's share to an escrow account.
+
+    On-chain account order:
+    [market, borrower, lender_position, vault, escrow_token_account,
+     market_authority, protocol_config, token_program, haircut_state]
+
+    Data layout: [discriminator only]
+
+    Args:
+        accounts: The instruction accounts.
+        program_id: Optional program ID override.
+
+    Returns:
+        The instruction.
+    """
+    data = struct.pack("<B", InstructionDiscriminator.ForceClosePosition)
+
+    resolved_program_id = program_id if program_id is not None else get_program_id()
+    return Instruction(
+        program_id=resolved_program_id,
+        accounts=[
+            AccountMeta(pubkey=accounts["market"], is_signer=False, is_writable=True),
+            AccountMeta(pubkey=accounts["borrower"], is_signer=True, is_writable=False),
+            AccountMeta(pubkey=accounts["lender_position"], is_signer=False, is_writable=True),
+            AccountMeta(pubkey=accounts["vault"], is_signer=False, is_writable=True),
+            AccountMeta(
+                pubkey=accounts["escrow_token_account"], is_signer=False, is_writable=True
+            ),
+            AccountMeta(pubkey=accounts["market_authority"], is_signer=False, is_writable=False),
+            AccountMeta(pubkey=accounts["protocol_config"], is_signer=False, is_writable=False),
+            AccountMeta(pubkey=accounts["token_program"], is_signer=False, is_writable=False),
+            AccountMeta(pubkey=accounts["haircut_state"], is_signer=False, is_writable=True),
+        ],
+        data=data,
+    )
+
+
+def create_claim_haircut_instruction(
+    accounts: ClaimHaircutAccountsDict,
+    program_id: Pubkey | None = None,
+) -> Instruction:
+    """
+    Create ClaimHaircut instruction.
+    Discriminator: 19
+
+    Allows a lender to claim their haircut recovery from a distressed market.
+
+    On-chain account order:
+    [market, lender, lender_position, lender_token_account, vault,
+     market_authority, haircut_state, protocol_config, token_program]
+
+    Data layout: [discriminator only]
+
+    Args:
+        accounts: The instruction accounts.
+        program_id: Optional program ID override.
+
+    Returns:
+        The instruction.
+    """
+    data = struct.pack("<B", InstructionDiscriminator.ClaimHaircut)
+
+    resolved_program_id = program_id if program_id is not None else get_program_id()
+    return Instruction(
+        program_id=resolved_program_id,
+        accounts=[
+            AccountMeta(pubkey=accounts["market"], is_signer=False, is_writable=True),
+            AccountMeta(pubkey=accounts["lender"], is_signer=True, is_writable=False),
+            AccountMeta(pubkey=accounts["lender_position"], is_signer=False, is_writable=True),
+            AccountMeta(pubkey=accounts["lender_token_account"], is_signer=False, is_writable=True),
+            AccountMeta(pubkey=accounts["vault"], is_signer=False, is_writable=True),
+            AccountMeta(pubkey=accounts["market_authority"], is_signer=False, is_writable=False),
+            AccountMeta(pubkey=accounts["haircut_state"], is_signer=False, is_writable=True),
+            AccountMeta(pubkey=accounts["protocol_config"], is_signer=False, is_writable=False),
+            AccountMeta(pubkey=accounts["token_program"], is_signer=False, is_writable=False),
+        ],
+        data=data,
+    )
+
+
+def create_force_claim_haircut_instruction(
+    accounts: ForceClaimHaircutAccountsDict,
+    program_id: Pubkey | None = None,
+) -> Instruction:
+    """
+    Create ForceClaimHaircut instruction.
+    Discriminator: 20
+
+    Allows the borrower to force-claim a lender's haircut recovery,
+    transferring the funds to an escrow account.
+
+    On-chain account order:
+    [market, borrower, lender_position, escrow_token_account, vault,
+     market_authority, haircut_state, protocol_config, token_program]
+
+    Data layout: [discriminator only]
+
+    Args:
+        accounts: The instruction accounts.
+        program_id: Optional program ID override.
+
+    Returns:
+        The instruction.
+    """
+    data = struct.pack("<B", InstructionDiscriminator.ForceClaimHaircut)
+
+    resolved_program_id = program_id if program_id is not None else get_program_id()
+    return Instruction(
+        program_id=resolved_program_id,
+        accounts=[
+            AccountMeta(pubkey=accounts["market"], is_signer=False, is_writable=True),
+            AccountMeta(pubkey=accounts["borrower"], is_signer=True, is_writable=False),
+            AccountMeta(pubkey=accounts["lender_position"], is_signer=False, is_writable=True),
+            AccountMeta(
+                pubkey=accounts["escrow_token_account"], is_signer=False, is_writable=True
+            ),
+            AccountMeta(pubkey=accounts["vault"], is_signer=False, is_writable=True),
+            AccountMeta(pubkey=accounts["market_authority"], is_signer=False, is_writable=False),
+            AccountMeta(pubkey=accounts["haircut_state"], is_signer=False, is_writable=True),
+            AccountMeta(pubkey=accounts["protocol_config"], is_signer=False, is_writable=False),
+            AccountMeta(pubkey=accounts["token_program"], is_signer=False, is_writable=False),
         ],
         data=data,
     )

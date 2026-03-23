@@ -60,7 +60,7 @@ class Storage(Protocol):
 
 
 class MemoryStorage:
-    """In-memory storage implementation for testing."""
+    """In-memory storage implementation for Node.js or testing."""
 
     def __init__(self) -> None:
         self._store: dict[str, str] = {}

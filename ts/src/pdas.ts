@@ -9,6 +9,7 @@ import {
   SEED_VAULT,
   SEED_BORROWER_WHITELIST,
   SEED_BLACKLIST,
+  SEED_HAIRCUT_STATE,
 } from './constants';
 
 /** BPF Loader Upgradeable program ID */
@@ -119,6 +120,18 @@ export function findBorrowerWhitelistPda(
 }
 
 /**
+ * Find the HaircutState PDA for a market.
+ * Seeds: [SEED_HAIRCUT_STATE, market_pubkey]
+ */
+export function findHaircutStatePda(market: PublicKey, programId?: PublicKey): [PublicKey, number] {
+  const resolvedProgramId = programId ?? getProgramId();
+  return PublicKey.findProgramAddressSync(
+    [SEED_HAIRCUT_STATE, market.toBuffer()],
+    resolvedProgramId
+  );
+}
+
+/**
  * Find a Blacklist check PDA (for external blacklist program).
  * Seeds: [SEED_BLACKLIST, address]
  */
@@ -168,4 +181,5 @@ export {
   SEED_VAULT,
   SEED_BORROWER_WHITELIST,
   SEED_BLACKLIST,
+  SEED_HAIRCUT_STATE,
 } from './constants';

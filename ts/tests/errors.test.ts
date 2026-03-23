@@ -22,10 +22,10 @@ import {
 
 describe('Error Handling', () => {
   describe('CoalescefiErrorCode', () => {
-    it('should have 43 error codes', () => {
+    it('should have 44 error codes', () => {
       // Count enum values (excluding reverse mappings)
       const codes = Object.values(CoalescefiErrorCode).filter((v) => typeof v === 'number');
-      expect(codes.length).toBe(43);
+      expect(codes.length).toBe(44);
     });
 
     it('should have codes 0-42', () => {

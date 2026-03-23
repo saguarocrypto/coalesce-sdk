@@ -23,7 +23,7 @@ use bytemuck::{Pod, Zeroable};
 /// - bump: u8                        (140)
 /// - is_paused: u8                   (141)
 /// - is_blacklist_fail_closed: u8    (142)
-/// - _padding: [u8; 51]              (143-193)
+/// - _padding: [u8; 51]              (143-193) (split: 32 + 19)
 #[derive(Clone, Copy, Pod, Zeroable)]
 #[repr(C)]
 pub struct ProtocolConfig {
@@ -99,7 +99,8 @@ impl ProtocolConfig {
 /// - last_accrual_timestamp: [u8; 8]       (204-211)
 /// - settlement_factor_wad: [u8; 16]       (212-227)
 /// - bump: u8                              (228)
-/// - _padding: [u8; 21]                    (229-249)
+/// - haircut_accumulator: [u8; 8]          (229-236)
+/// - _padding: [u8; 13]                    (237-249)
 #[derive(Clone, Copy, Pod, Zeroable)]
 #[repr(C)]
 pub struct Market {
@@ -119,7 +120,7 @@ pub struct Market {
     pub annual_interest_bps: [u8; 2],
     /// Loan maturity timestamp (little-endian i64)
     pub maturity_timestamp: [u8; 8],
-    /// Borrow cap normalized (little-endian u64)
+    /// Market capacity in raw-principal USDC (little-endian u64)
     pub max_total_supply: [u8; 8],
     /// PDA derivation nonce (little-endian u64)
     pub market_nonce: [u8; 8],
@@ -129,7 +130,7 @@ pub struct Market {
     pub scale_factor: [u8; 16],
     /// Uncollected fees (little-endian u64)
     pub accrued_protocol_fees: [u8; 8],
-    /// Running total deposits (little-endian u64)
+    /// Running total raw-principal deposits (little-endian u64)
     pub total_deposited: [u8; 8],
     /// Running total borrowed (little-endian u64)
     pub total_borrowed: [u8; 8],
@@ -143,8 +144,10 @@ pub struct Market {
     pub settlement_factor_wad: [u8; 16],
     /// Market PDA bump
     pub bump: u8,
-    /// Padding for future use
-    pub _padding: [u8; 21],
+    /// Cumulative haircut gap from distressed withdrawals (COAL-H01, little-endian u64)
+    pub haircut_accumulator: [u8; 8],
+    /// Reserved padding
+    pub _padding: [u8; 13],
 }
 
 impl Market {
@@ -222,6 +225,11 @@ impl Market {
     pub fn is_matured(&self, current_timestamp: i64) -> bool {
         current_timestamp >= self.maturity_timestamp()
     }
+
+    /// Get haircut accumulator as u64 (COAL-H01).
+    pub fn haircut_accumulator(&self) -> u64 {
+        u64::from_le_bytes(self.haircut_accumulator)
+    }
 }
 
 /// LenderPosition account structure (128 bytes).
@@ -233,7 +241,9 @@ impl Market {
 /// - lender: [u8; 32]            (41-72)
 /// - scaled_balance: [u8; 16]    (73-88)
 /// - bump: u8                    (89)
-/// - _padding: [u8; 38]          (90-127)
+/// - haircut_owed: [u8; 8]       (90-97)
+/// - withdrawal_sf: [u8; 16]     (98-113)
+/// - _padding: [u8; 14]          (114-127)
 #[derive(Clone, Copy, Pod, Zeroable)]
 #[repr(C)]
 pub struct LenderPosition {
@@ -249,9 +259,12 @@ pub struct LenderPosition {
     pub scaled_balance: [u8; 16],
     /// PDA bump
     pub bump: u8,
-    /// Padding for future use (split for bytemuck compatibility: 32 + 6 = 38)
-    pub _padding1: [u8; 32],
-    pub _padding2: [u8; 6],
+    /// Haircut recovery owed to this lender (little-endian u64)
+    pub haircut_owed: [u8; 8],
+    /// Settlement factor at time of last withdrawal (little-endian u128)
+    pub withdrawal_sf: [u8; 16],
+    /// Reserved padding
+    pub _padding: [u8; 14],
 }
 
 impl LenderPosition {
@@ -263,6 +276,16 @@ impl LenderPosition {
     /// Check if position has balance.
     pub fn has_balance(&self) -> bool {
         self.scaled_balance() > 0
+    }
+
+    /// Get haircut recovery owed as u64.
+    pub fn haircut_owed(&self) -> u64 {
+        u64::from_le_bytes(self.haircut_owed)
+    }
+
+    /// Get withdrawal settlement factor as u128 (WAD precision).
+    pub fn withdrawal_sf(&self) -> u128 {
+        u128::from_le_bytes(self.withdrawal_sf)
     }
 }
 
@@ -317,7 +340,54 @@ impl BorrowerWhitelist {
 
     /// Get available borrow capacity.
     pub fn available_capacity(&self) -> u64 {
-        self.max_borrow_capacity().saturating_sub(self.current_borrowed())
+        self.max_borrow_capacity()
+            .saturating_sub(self.current_borrowed())
+    }
+}
+
+/// HaircutState account structure (88 bytes).
+///
+/// Layout:
+/// - discriminator: [u8; 8]       (0-7)
+/// - version: u8                  (8)
+/// - market: [u8; 32]             (9-40)
+/// - claim_weight_sum: [u8; 16]   (41-56)
+/// - claim_offset_sum: [u8; 16]   (57-72)
+/// - bump: u8                     (73)
+/// - _padding: [u8; 14]           (74-87)
+#[derive(Clone, Copy, Pod, Zeroable)]
+#[repr(C)]
+pub struct HaircutState {
+    /// Account discriminator (8 bytes): "COALHCST"
+    pub discriminator: [u8; 8],
+    /// Account schema version
+    pub version: u8,
+    /// Market this haircut state belongs to
+    pub market: [u8; 32],
+    /// Sum of claim weights (little-endian u128)
+    pub claim_weight_sum: [u8; 16],
+    /// Sum of claim offsets (little-endian u128)
+    pub claim_offset_sum: [u8; 16],
+    /// PDA bump
+    pub bump: u8,
+    /// Reserved padding
+    pub _padding: [u8; 14],
+}
+
+impl HaircutState {
+    /// Get the market pubkey.
+    pub fn market_pubkey(&self) -> solana_program::pubkey::Pubkey {
+        solana_program::pubkey::Pubkey::new_from_array(self.market)
+    }
+
+    /// Get claim weight sum as u128.
+    pub fn claim_weight_sum(&self) -> u128 {
+        u128::from_le_bytes(self.claim_weight_sum)
+    }
+
+    /// Get claim offset sum as u128.
+    pub fn claim_offset_sum(&self) -> u128 {
+        u128::from_le_bytes(self.claim_offset_sum)
     }
 }
 
@@ -449,6 +519,15 @@ mod tests {
     }
 
     #[test]
+    fn test_haircut_state_size() {
+        assert_eq!(
+            std::mem::size_of::<HaircutState>(),
+            HAIRCUT_STATE_SIZE,
+            "HaircutState size mismatch"
+        );
+    }
+
+    #[test]
     fn test_borrower_whitelist_size() {
         assert_eq!(
             std::mem::size_of::<BorrowerWhitelist>(),
@@ -480,6 +559,7 @@ mod tests {
         market.market_nonce = 42u64.to_le_bytes();
         market.scale_factor = WAD.to_le_bytes();
         market.settlement_factor_wad = WAD.to_le_bytes();
+        market.haircut_accumulator = 500u64.to_le_bytes();
 
         assert_eq!(market.annual_interest_bps(), 1000);
         assert_eq!(market.maturity_timestamp(), 1700000000);
@@ -489,6 +569,7 @@ mod tests {
         assert!(market.is_settled());
         assert!(market.is_matured(1700000001));
         assert!(!market.is_matured(1699999999));
+        assert_eq!(market.haircut_accumulator(), 500);
     }
 
     #[test]

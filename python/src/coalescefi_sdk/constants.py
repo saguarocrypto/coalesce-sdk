@@ -177,6 +177,7 @@ SEED_MARKET_AUTHORITY = b"market_authority"
 SEED_LENDER = b"lender"
 SEED_VAULT = b"vault"
 SEED_BORROWER_WHITELIST = b"borrower_whitelist"
+SEED_HAIRCUT_STATE = b"haircut_state"
 SEED_BLACKLIST = b"blacklist"
 
 # =============================================================================
@@ -205,6 +206,7 @@ PROTOCOL_CONFIG_SIZE: int = 194
 MARKET_SIZE: int = 250
 LENDER_POSITION_SIZE: int = 128
 BORROWER_WHITELIST_SIZE: int = 96
+HAIRCUT_STATE_SIZE: int = 88
 
 # =============================================================================
 # Account Discriminators (8 bytes)
@@ -214,6 +216,7 @@ DISC_PROTOCOL_CONFIG = b"COALPC__"
 DISC_MARKET = b"COALMKT_"
 DISC_LENDER_POSITION = b"COALLPOS"
 DISC_BORROWER_WL = b"COALBWL_"
+DISC_HAIRCUT_STATE = b"COALHCST"
 
 # =============================================================================
 # Instruction Discriminators
@@ -257,6 +260,15 @@ class InstructionDiscriminator(IntEnum):
     SetBlacklistMode = 14
     SetAdmin = 15
     SetWhitelistManager = 16
+
+    # Discriminator 17 is intentionally skipped (reserved).
+
+    # FORCE CLOSE (18)
+    ForceClosePosition = 18
+
+    # HAIRCUT RECOVERY (19-20)
+    ClaimHaircut = 19
+    ForceClaimHaircut = 20
 
 
 # =============================================================================

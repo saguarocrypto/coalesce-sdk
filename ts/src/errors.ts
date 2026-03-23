@@ -10,7 +10,7 @@
  * - BALANCE/CAPACITY ERRORS (21-27)
  * - MARKET STATE ERRORS (28-35)
  * - FEE/WITHDRAWAL ERRORS (36-40)
- * - OPERATIONAL ERRORS (41-42)
+ * - OPERATIONAL ERRORS (41-43)
  */
 export enum CoalescefiErrorCode {
   // ═══════════════════════════════════════════════════════════════
@@ -124,12 +124,14 @@ export enum CoalescefiErrorCode {
   NoExcessToWithdraw = 40,
 
   // ═══════════════════════════════════════════════════════════════
-  // OPERATIONAL ERRORS (41-42)
+  // OPERATIONAL ERRORS (41-43)
   // ═══════════════════════════════════════════════════════════════
   /** ERR-042: Arithmetic overflow */
   MathOverflow = 41,
   /** ERR-043: Slippage protection triggered */
   PayoutBelowMinimum = 42,
+  /** ERR-044: Lender has no haircut claim to recover */
+  NoHaircutToClaim = 43,
 }
 
 /**
@@ -204,6 +206,7 @@ export const ERROR_MESSAGES: Record<CoalescefiErrorCode, string> = {
   [CoalescefiErrorCode.MathOverflow]: 'Mathematical overflow or underflow',
   [CoalescefiErrorCode.PayoutBelowMinimum]:
     'Payout is below the minimum specified (slippage protection triggered)',
+  [CoalescefiErrorCode.NoHaircutToClaim]: 'Lender has no haircut claim to recover',
 };
 
 /**
@@ -488,11 +491,11 @@ export function getErrorRecoveryAction(code: CoalescefiErrorCode): string | null
     [CoalescefiErrorCode.SettlementGracePeriod]:
       'Wait 5 minutes after maturity for the settlement grace period to elapse',
     [CoalescefiErrorCode.NotSettled]:
-      'Market must be settled first - call withdraw to trigger settlement',
+      'Market must be settled first - call withdraw or force-close to trigger settlement',
     [CoalescefiErrorCode.SettlementNotImproved]:
       'New settlement must be better than current - ensure more funds were added to vault',
     [CoalescefiErrorCode.SettlementNotComplete]:
-      'Settlement has not occurred yet - wait for first withdrawal after maturity',
+      'Settlement has not occurred yet - wait for first withdrawal or force-close after maturity (must be after the 5-minute grace period)',
 
     // Authorization errors (need different permissions)
     [CoalescefiErrorCode.Unauthorized]:
@@ -546,6 +549,8 @@ export function getErrorRecoveryAction(code: CoalescefiErrorCode): string | null
       'Reduce repayment amount to match or be less than the outstanding debt',
     [CoalescefiErrorCode.BorrowerHasActiveDebt]:
       'Borrower must repay all outstanding debt before being blacklisted',
+    [CoalescefiErrorCode.NoHaircutToClaim]:
+      'No haircut claim to recover — either no distressed withdrawal occurred or the claim has already been fully recovered',
   };
   return recoveryActions[code] ?? null;
 }
