@@ -106,7 +106,7 @@ export interface Market {
   scaleFactor: ScaledAmount;
   /** Uncollected fees (8 bytes, u64) */
   accruedProtocolFees: TokenAmount;
-  /** Running total deposits (8 bytes, u64) */
+  /** Capacity tracker: increases on deposit, decreases by withdrawal payout (8 bytes, u64) */
   totalDeposited: TokenAmount;
   /** Running total borrowed (8 bytes, u64) */
   totalBorrowed: TokenAmount;
@@ -120,6 +120,8 @@ export interface Market {
   settlementFactorWad: ScaledAmount;
   /** Market PDA bump (1 byte, u8) */
   bump: U8;
+  /** Cumulative haircut gap from distressed withdrawals (8 bytes, u64) */
+  haircutAccumulator: TokenAmount;
 }
 
 /**
@@ -135,6 +137,28 @@ export interface LenderPosition {
   lender: PublicKey;
   /** Lender's share balance (16 bytes, u128) */
   scaledBalance: ScaledAmount;
+  /** PDA bump (1 byte, u8) */
+  bump: U8;
+  /** Token amount the lender was shorted during distressed withdrawal (8 bytes, u64) */
+  haircutOwed: TokenAmount;
+  /** Settlement factor at which the lender last withdrew or claimed (16 bytes, u128) */
+  withdrawalSf: ScaledAmount;
+}
+
+/**
+ * HaircutState account structure (88 bytes).
+ * Per-market aggregate haircut state for the conservative re_settle solver.
+ * Matches the Rust #[repr(C)] struct exactly.
+ */
+export interface HaircutState {
+  /** Account schema version (1 byte, u8) */
+  version: U8;
+  /** Market this state belongs to (32 bytes) */
+  market: PublicKey;
+  /** Sum of per-position weight contributions (16 bytes, u128) */
+  claimWeightSum: ScaledAmount;
+  /** Sum of per-position offset contributions (16 bytes, u128) */
+  claimOffsetSum: ScaledAmount;
   /** PDA bump (1 byte, u8) */
   bump: U8;
 }
@@ -273,6 +297,7 @@ export interface CreateMarketAccounts {
   blacklistCheck: PublicKey;
   systemProgram: PublicKey;
   tokenProgram: PublicKey;
+  haircutState: PublicKey;
 }
 
 export interface DepositAccounts {
@@ -322,6 +347,8 @@ export interface WithdrawAccounts {
   blacklistCheck: PublicKey;
   protocolConfig: PublicKey;
   tokenProgram: PublicKey;
+  /** HaircutState PDA for tracking distressed withdrawal haircuts */
+  haircutState: PublicKey;
 }
 
 export interface CollectFeesAccounts {
@@ -347,6 +374,8 @@ export interface ReSettleAccounts {
   vault: PublicKey;
   /** Protocol configuration - required for proper fee accrual during re-settlement */
   protocolConfig: PublicKey;
+  /** HaircutState PDA for conservative settlement factor computation */
+  haircutState: PublicKey;
 }
 
 export interface SetBorrowerWhitelistAccounts {
@@ -396,9 +425,54 @@ export interface WithdrawExcessAccounts {
   marketAuthority: PublicKey;
   tokenProgram: PublicKey;
   protocolConfig: PublicKey;
+  blacklistCheck: PublicKey;
+  borrowerWhitelist: PublicKey;
 }
 
 export interface WithdrawExcessArgs {} // Empty - no args
+
+export interface ForceClosePositionAccounts {
+  market: PublicKey;
+  borrower: PublicKey;
+  lenderPosition: PublicKey;
+  vault: PublicKey;
+  escrowTokenAccount: PublicKey;
+  marketAuthority: PublicKey;
+  protocolConfig: PublicKey;
+  tokenProgram: PublicKey;
+  /** HaircutState PDA for tracking distressed withdrawal haircuts */
+  haircutState: PublicKey;
+}
+
+export interface ForceClosePositionArgs {} // Empty - no args beyond discriminator
+
+export interface ClaimHaircutAccounts {
+  market: PublicKey;
+  lender: PublicKey;
+  lenderPosition: PublicKey;
+  lenderTokenAccount: PublicKey;
+  vault: PublicKey;
+  marketAuthority: PublicKey;
+  haircutState: PublicKey;
+  protocolConfig: PublicKey;
+  tokenProgram: PublicKey;
+}
+
+export interface ClaimHaircutArgs {} // Empty - no args beyond discriminator
+
+export interface ForceClaimHaircutAccounts {
+  market: PublicKey;
+  borrower: PublicKey;
+  lenderPosition: PublicKey;
+  escrowTokenAccount: PublicKey;
+  vault: PublicKey;
+  marketAuthority: PublicKey;
+  haircutState: PublicKey;
+  protocolConfig: PublicKey;
+  tokenProgram: PublicKey;
+}
+
+export interface ForceClaimHaircutArgs {} // Empty - no args beyond discriminator
 
 /**
  * Accounts for a waterfall repay (interest-first, then principal).

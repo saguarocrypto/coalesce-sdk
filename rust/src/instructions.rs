@@ -74,6 +74,7 @@ pub struct CreateMarketAccounts {
     pub blacklist_check: Pubkey,
     pub system_program: Pubkey,
     pub token_program: Pubkey,
+    pub haircut_state: Pubkey,
 }
 
 /// Accounts for Deposit instruction.
@@ -136,6 +137,7 @@ pub struct WithdrawAccounts {
     pub blacklist_check: Pubkey,
     pub protocol_config: Pubkey,
     pub token_program: Pubkey,
+    pub haircut_state: Pubkey,
 }
 
 /// Accounts for CollectFees instruction.
@@ -154,6 +156,7 @@ pub struct ReSettleAccounts {
     pub market: Pubkey,
     pub vault: Pubkey,
     pub protocol_config: Pubkey,
+    pub haircut_state: Pubkey,
 }
 
 /// Accounts for CloseLenderPosition instruction.
@@ -174,6 +177,8 @@ pub struct WithdrawExcessAccounts {
     pub market_authority: Pubkey,
     pub token_program: Pubkey,
     pub protocol_config: Pubkey,
+    pub blacklist_check: Pubkey,
+    pub borrower_whitelist: Pubkey,
 }
 
 /// Accounts for SetBorrowerWhitelist instruction.
@@ -209,6 +214,19 @@ pub struct SetWhitelistManagerAccounts {
     pub protocol_config: Pubkey,
     pub admin: Pubkey,
     pub new_whitelist_manager: Pubkey,
+}
+
+/// Accounts for ForceClosePosition instruction.
+pub struct ForceClosePositionAccounts {
+    pub market: Pubkey,
+    pub borrower: Pubkey,
+    pub lender_position: Pubkey,
+    pub vault: Pubkey,
+    pub escrow_token_account: Pubkey,
+    pub market_authority: Pubkey,
+    pub protocol_config: Pubkey,
+    pub token_program: Pubkey,
+    pub haircut_state: Pubkey,
 }
 
 // ============================================================================
@@ -295,6 +313,7 @@ pub fn create_create_market_instruction(
             AccountMeta::new_readonly(accounts.blacklist_check, false),
             AccountMeta::new_readonly(accounts.system_program, false),
             AccountMeta::new_readonly(accounts.token_program, false),
+            AccountMeta::new(accounts.haircut_state, false),
         ],
         data,
     }
@@ -444,6 +463,7 @@ pub fn create_withdraw_instruction(
             AccountMeta::new_readonly(accounts.blacklist_check, false),
             AccountMeta::new_readonly(accounts.protocol_config, false),
             AccountMeta::new_readonly(accounts.token_program, false),
+            AccountMeta::new(accounts.haircut_state, false),
         ],
         data,
     }
@@ -480,10 +500,7 @@ pub fn create_collect_fees_instruction(
 /// Data layout: [discriminator only] - permissionless, no args
 ///
 /// The new settlement factor is computed automatically from the vault balance.
-pub fn create_resettle_instruction(
-    accounts: ReSettleAccounts,
-    program_id: &Pubkey,
-) -> Instruction {
+pub fn create_resettle_instruction(accounts: ReSettleAccounts, program_id: &Pubkey) -> Instruction {
     let data = vec![InstructionDiscriminator::ReSettle.to_u8()];
 
     Instruction {
@@ -492,6 +509,7 @@ pub fn create_resettle_instruction(
             AccountMeta::new(accounts.market, false),
             AccountMeta::new_readonly(accounts.vault, false),
             AccountMeta::new_readonly(accounts.protocol_config, false),
+            AccountMeta::new_readonly(accounts.haircut_state, false),
         ],
         data,
     }
@@ -529,7 +547,7 @@ pub fn create_close_lender_position_instruction(
 ///
 /// Allows the borrower to withdraw excess funds from the vault.
 ///
-/// On-chain account order: [market, borrower, borrower_token, vault, market_authority, token_program, protocol_config]
+/// On-chain account order: [market, borrower, borrower_token, vault, market_authority, token_program, protocol_config, blacklist_check, borrower_whitelist]
 pub fn create_withdraw_excess_instruction(
     accounts: WithdrawExcessAccounts,
     program_id: &Pubkey,
@@ -546,6 +564,8 @@ pub fn create_withdraw_excess_instruction(
             AccountMeta::new_readonly(accounts.market_authority, false),
             AccountMeta::new_readonly(accounts.token_program, false),
             AccountMeta::new_readonly(accounts.protocol_config, false),
+            AccountMeta::new_readonly(accounts.blacklist_check, false),
+            AccountMeta::new_readonly(accounts.borrower_whitelist, false),
         ],
         data,
     }
@@ -662,6 +682,120 @@ pub fn create_set_whitelist_manager_instruction(
             AccountMeta::new(accounts.protocol_config, false),
             AccountMeta::new_readonly(accounts.admin, true),
             AccountMeta::new_readonly(accounts.new_whitelist_manager, false),
+        ],
+        data,
+    }
+}
+
+/// Create ForceClosePosition instruction.
+///
+/// Data layout: `[18]` (discriminator only, no additional data)
+///
+/// Borrower force-closes a lender position after maturity + grace period.
+/// Computes payout (same as withdraw), transfers to escrow ATA, zeros
+/// the position, and decrements scaled_total_supply.
+pub fn create_force_close_position_instruction(
+    accounts: ForceClosePositionAccounts,
+    program_id: &Pubkey,
+) -> Instruction {
+    let data = vec![InstructionDiscriminator::ForceClosePosition.to_u8()];
+
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(accounts.market, false),
+            AccountMeta::new_readonly(accounts.borrower, true),
+            AccountMeta::new(accounts.lender_position, false),
+            AccountMeta::new(accounts.vault, false),
+            AccountMeta::new(accounts.escrow_token_account, false),
+            AccountMeta::new_readonly(accounts.market_authority, false),
+            AccountMeta::new_readonly(accounts.protocol_config, false),
+            AccountMeta::new_readonly(accounts.token_program, false),
+            AccountMeta::new(accounts.haircut_state, false),
+        ],
+        data,
+    }
+}
+
+/// Accounts for ClaimHaircut instruction.
+pub struct ClaimHaircutAccounts {
+    pub market: Pubkey,
+    pub lender: Pubkey,
+    pub lender_position: Pubkey,
+    pub lender_token_account: Pubkey,
+    pub vault: Pubkey,
+    pub market_authority: Pubkey,
+    pub haircut_state: Pubkey,
+    pub protocol_config: Pubkey,
+    pub token_program: Pubkey,
+}
+
+/// Create ClaimHaircut instruction.
+///
+/// Discriminator: 19
+/// Data layout: [discriminator only]
+///
+/// Allows a lender to claim their haircut recovery tokens.
+pub fn create_claim_haircut_instruction(
+    accounts: ClaimHaircutAccounts,
+    program_id: &Pubkey,
+) -> Instruction {
+    let data = vec![InstructionDiscriminator::ClaimHaircut.to_u8()];
+
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(accounts.market, false),
+            AccountMeta::new_readonly(accounts.lender, true),
+            AccountMeta::new(accounts.lender_position, false),
+            AccountMeta::new(accounts.lender_token_account, false),
+            AccountMeta::new(accounts.vault, false),
+            AccountMeta::new_readonly(accounts.market_authority, false),
+            AccountMeta::new(accounts.haircut_state, false),
+            AccountMeta::new_readonly(accounts.protocol_config, false),
+            AccountMeta::new_readonly(accounts.token_program, false),
+        ],
+        data,
+    }
+}
+
+/// Accounts for ForceClaimHaircut instruction.
+pub struct ForceClaimHaircutAccounts {
+    pub market: Pubkey,
+    pub borrower: Pubkey,
+    pub lender_position: Pubkey,
+    pub escrow_token_account: Pubkey,
+    pub vault: Pubkey,
+    pub market_authority: Pubkey,
+    pub haircut_state: Pubkey,
+    pub protocol_config: Pubkey,
+    pub token_program: Pubkey,
+}
+
+/// Create ForceClaimHaircut instruction.
+///
+/// Discriminator: 20
+/// Data layout: [discriminator only]
+///
+/// Allows the borrower to force-claim haircut recovery on behalf of a lender.
+pub fn create_force_claim_haircut_instruction(
+    accounts: ForceClaimHaircutAccounts,
+    program_id: &Pubkey,
+) -> Instruction {
+    let data = vec![InstructionDiscriminator::ForceClaimHaircut.to_u8()];
+
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(accounts.market, false),
+            AccountMeta::new_readonly(accounts.borrower, true),
+            AccountMeta::new(accounts.lender_position, false),
+            AccountMeta::new(accounts.escrow_token_account, false),
+            AccountMeta::new(accounts.vault, false),
+            AccountMeta::new_readonly(accounts.market_authority, false),
+            AccountMeta::new(accounts.haircut_state, false),
+            AccountMeta::new_readonly(accounts.protocol_config, false),
+            AccountMeta::new_readonly(accounts.token_program, false),
         ],
         data,
     }
@@ -793,13 +927,18 @@ mod tests {
             system_program: test_pubkey(6),
             program_data: test_pubkey(7),
         };
-        let args = InitializeProtocolArgs { fee_rate_bps: 500 };
+        let args = InitializeProtocolArgs {
+            fee_rate_bps: 500,
+        };
 
         let ix = create_initialize_protocol_instruction(accounts, args, &program_id);
 
         assert_eq!(ix.program_id, program_id);
         assert_eq!(ix.accounts.len(), 7);
-        assert_eq!(ix.data[0], InstructionDiscriminator::InitializeProtocol.to_u8());
+        assert_eq!(
+            ix.data[0],
+            InstructionDiscriminator::InitializeProtocol.to_u8()
+        );
         assert_eq!(u16::from_le_bytes([ix.data[1], ix.data[2]]), 500);
     }
 
@@ -844,6 +983,7 @@ mod tests {
             blacklist_check: test_pubkey(7),
             protocol_config: test_pubkey(8),
             token_program: test_pubkey(9),
+            haircut_state: test_pubkey(10),
         };
         let args = WithdrawArgs {
             scaled_amount: 1_000_000_000_000_000_000u128,
@@ -853,7 +993,7 @@ mod tests {
         let ix = create_withdraw_instruction(accounts, args, &program_id);
 
         assert_eq!(ix.program_id, program_id);
-        assert_eq!(ix.accounts.len(), 9);
+        assert_eq!(ix.accounts.len(), 10);
         assert_eq!(ix.data[0], InstructionDiscriminator::Withdraw.to_u8());
         // Data: 1 byte discriminator + 16 bytes scaled_amount + 8 bytes min_payout
         assert_eq!(ix.data.len(), 1 + 16 + 8);
@@ -873,6 +1013,7 @@ mod tests {
             blacklist_check: test_pubkey(8),
             system_program: test_pubkey(9),
             token_program: test_pubkey(10),
+            haircut_state: test_pubkey(11),
         };
         let args = CreateMarketArgs {
             market_nonce: 42,
@@ -884,7 +1025,7 @@ mod tests {
         let ix = create_create_market_instruction(accounts, args, &program_id);
 
         assert_eq!(ix.program_id, program_id);
-        assert_eq!(ix.accounts.len(), 10);
+        assert_eq!(ix.accounts.len(), 11);
         assert_eq!(ix.data[0], InstructionDiscriminator::CreateMarket.to_u8());
         // Data: 1 + 8 + 2 + 8 + 8 = 27 bytes
         assert_eq!(ix.data.len(), 27);
@@ -960,7 +1101,10 @@ mod tests {
 
         assert_eq!(ixs.len(), 2);
         // First: RepayInterest (disc 6), 6 accounts
-        assert_eq!(ixs[0].data[0], InstructionDiscriminator::RepayInterest.to_u8());
+        assert_eq!(
+            ixs[0].data[0],
+            InstructionDiscriminator::RepayInterest.to_u8()
+        );
         assert_eq!(ixs[0].accounts.len(), 6);
         // Second: Repay (disc 5), 8 accounts
         assert_eq!(ixs[1].data[0], InstructionDiscriminator::Repay.to_u8());
@@ -999,7 +1143,10 @@ mod tests {
         );
 
         assert_eq!(ixs.len(), 1);
-        assert_eq!(ixs[0].data[0], InstructionDiscriminator::RepayInterest.to_u8());
+        assert_eq!(
+            ixs[0].data[0],
+            InstructionDiscriminator::RepayInterest.to_u8()
+        );
     }
 
     #[test]

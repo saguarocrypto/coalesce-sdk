@@ -6,11 +6,12 @@ use bytemuck::try_from_bytes;
 use solana_program::pubkey::Pubkey;
 
 use crate::constants::{
-    BORROWER_WHITELIST_SIZE, DISC_BORROWER_WL, DISC_LENDER_POSITION, DISC_MARKET,
-    DISC_PROTOCOL_CONFIG, LENDER_POSITION_SIZE, MARKET_SIZE, PROTOCOL_CONFIG_SIZE,
+    BORROWER_WHITELIST_SIZE, DISC_BORROWER_WL, DISC_HAIRCUT_STATE, DISC_LENDER_POSITION,
+    DISC_MARKET, DISC_PROTOCOL_CONFIG, HAIRCUT_STATE_SIZE, LENDER_POSITION_SIZE, MARKET_SIZE,
+    PROTOCOL_CONFIG_SIZE,
 };
 use crate::errors::CoalescefiError;
-use crate::types::{BorrowerWhitelist, LenderPosition, Market, ProtocolConfig};
+use crate::types::{BorrowerWhitelist, HaircutState, LenderPosition, Market, ProtocolConfig};
 
 /// Account type enum for runtime type detection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,6 +24,8 @@ pub enum AccountType {
     LenderPosition,
     /// BorrowerWhitelist account.
     BorrowerWhitelist,
+    /// HaircutState account.
+    HaircutState,
 }
 
 impl AccountType {
@@ -33,6 +36,7 @@ impl AccountType {
             AccountType::Market => MARKET_SIZE,
             AccountType::LenderPosition => LENDER_POSITION_SIZE,
             AccountType::BorrowerWhitelist => BORROWER_WHITELIST_SIZE,
+            AccountType::HaircutState => HAIRCUT_STATE_SIZE,
         }
     }
 
@@ -43,6 +47,7 @@ impl AccountType {
             AccountType::Market => DISC_MARKET,
             AccountType::LenderPosition => DISC_LENDER_POSITION,
             AccountType::BorrowerWhitelist => DISC_BORROWER_WL,
+            AccountType::HaircutState => DISC_HAIRCUT_STATE,
         }
     }
 }
@@ -65,6 +70,9 @@ pub fn detect_account_type(data: &[u8]) -> Option<AccountType> {
         }
         d if d == DISC_BORROWER_WL && data.len() >= BORROWER_WHITELIST_SIZE => {
             Some(AccountType::BorrowerWhitelist)
+        }
+        d if d == DISC_HAIRCUT_STATE && data.len() >= HAIRCUT_STATE_SIZE => {
+            Some(AccountType::HaircutState)
         }
         _ => None,
     }
@@ -138,6 +146,20 @@ pub fn decode_borrower_whitelist(data: &[u8]) -> Result<&BorrowerWhitelist, Coal
         .map_err(|_| CoalescefiError::InvalidAccountOwner)
 }
 
+/// Decode a HaircutState account from raw bytes (zero-copy).
+///
+/// # Errors
+/// Returns an error if the data is too short or has invalid discriminator.
+pub fn decode_haircut_state(data: &[u8]) -> Result<&HaircutState, CoalescefiError> {
+    if data.len() < HAIRCUT_STATE_SIZE {
+        return Err(CoalescefiError::InvalidAccountOwner);
+    }
+
+    check_discriminator(data, DISC_HAIRCUT_STATE)?;
+
+    try_from_bytes(&data[..HAIRCUT_STATE_SIZE]).map_err(|_| CoalescefiError::InvalidAccountOwner)
+}
+
 /// Decoded account enum for dynamic dispatch.
 pub enum DecodedAccount<'a> {
     /// ProtocolConfig account.
@@ -148,6 +170,8 @@ pub enum DecodedAccount<'a> {
     LenderPosition(&'a LenderPosition),
     /// BorrowerWhitelist account.
     BorrowerWhitelist(&'a BorrowerWhitelist),
+    /// HaircutState account.
+    HaircutState(&'a HaircutState),
 }
 
 impl<'a> core::fmt::Debug for DecodedAccount<'a> {
@@ -157,6 +181,7 @@ impl<'a> core::fmt::Debug for DecodedAccount<'a> {
             Self::Market(_) => write!(f, "DecodedAccount::Market"),
             Self::LenderPosition(_) => write!(f, "DecodedAccount::LenderPosition"),
             Self::BorrowerWhitelist(_) => write!(f, "DecodedAccount::BorrowerWhitelist"),
+            Self::HaircutState(_) => write!(f, "DecodedAccount::HaircutState"),
         }
     }
 }
@@ -168,16 +193,19 @@ pub fn decode_account(data: &[u8]) -> Result<DecodedAccount<'_>, CoalescefiError
     let account_type = detect_account_type(data).ok_or(CoalescefiError::InvalidAccountOwner)?;
 
     match account_type {
-        AccountType::ProtocolConfig => {
-            Ok(DecodedAccount::ProtocolConfig(decode_protocol_config(data)?))
-        }
+        AccountType::ProtocolConfig => Ok(DecodedAccount::ProtocolConfig(decode_protocol_config(
+            data,
+        )?)),
         AccountType::Market => Ok(DecodedAccount::Market(decode_market(data)?)),
-        AccountType::LenderPosition => {
-            Ok(DecodedAccount::LenderPosition(decode_lender_position(data)?))
-        }
+        AccountType::LenderPosition => Ok(DecodedAccount::LenderPosition(decode_lender_position(
+            data,
+        )?)),
         AccountType::BorrowerWhitelist => Ok(DecodedAccount::BorrowerWhitelist(
             decode_borrower_whitelist(data)?,
         )),
+        AccountType::HaircutState => {
+            Ok(DecodedAccount::HaircutState(decode_haircut_state(data)?))
+        }
     }
 }
 
@@ -348,6 +376,19 @@ mod rpc {
         }
     }
 
+    /// Fetch and decode a HaircutState account.
+    pub fn fetch_haircut_state(
+        client: &RpcClient,
+        address: &Pubkey,
+    ) -> Result<HaircutState, CoalescefiError> {
+        let account = client
+            .get_account(address)
+            .map_err(|_| CoalescefiError::InvalidAddress)?;
+
+        let state = decode_haircut_state(&account.data)?;
+        Ok(*state)
+    }
+
     /// Fetch and decode a BorrowerWhitelist account, returning None if not found.
     pub fn try_fetch_borrower_whitelist(
         client: &RpcClient,
@@ -357,6 +398,19 @@ mod rpc {
             Ok(account) => {
                 let whitelist = decode_borrower_whitelist(&account.data)?;
                 Ok(Some(*whitelist))
+            }
+            Err(_) => Ok(None),
+        }
+    }
+    /// Fetch and decode a HaircutState account, returning None if not found.
+    pub fn try_fetch_haircut_state(
+        client: &RpcClient,
+        address: &Pubkey,
+    ) -> Result<Option<HaircutState>, CoalescefiError> {
+        match client.get_account(address) {
+            Ok(account) => {
+                let state = decode_haircut_state(&account.data)?;
+                Ok(Some(*state))
             }
             Err(_) => Ok(None),
         }
@@ -392,6 +446,14 @@ mod tests {
         data[..8].copy_from_slice(DISC_LENDER_POSITION);
         data[8] = 1; // version
         data[89] = 253; // bump
+        data
+    }
+
+    fn create_test_haircut_state() -> Vec<u8> {
+        let mut data = vec![0u8; HAIRCUT_STATE_SIZE];
+        data[..8].copy_from_slice(DISC_HAIRCUT_STATE);
+        data[8] = 1; // version
+        data[73] = 251; // bump
         data
     }
 
@@ -443,6 +505,15 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_haircut_state() {
+        let data = create_test_haircut_state();
+        let state = decode_haircut_state(&data).unwrap();
+
+        assert_eq!(state.version, 1);
+        assert_eq!(state.bump, 251);
+    }
+
+    #[test]
     fn test_detect_account_type() {
         let protocol_config = create_test_protocol_config();
         assert_eq!(
@@ -463,6 +534,12 @@ mod tests {
         assert_eq!(
             detect_account_type(&borrower_whitelist),
             Some(AccountType::BorrowerWhitelist)
+        );
+
+        let haircut_state = create_test_haircut_state();
+        assert_eq!(
+            detect_account_type(&haircut_state),
+            Some(AccountType::HaircutState)
         );
 
         // Invalid data
@@ -527,6 +604,7 @@ mod tests {
             AccountType::BorrowerWhitelist.size(),
             BORROWER_WHITELIST_SIZE
         );
+        assert_eq!(AccountType::HaircutState.size(), HAIRCUT_STATE_SIZE);
     }
 
     #[test]
@@ -543,6 +621,10 @@ mod tests {
         assert_eq!(
             AccountType::BorrowerWhitelist.discriminator(),
             DISC_BORROWER_WL
+        );
+        assert_eq!(
+            AccountType::HaircutState.discriminator(),
+            DISC_HAIRCUT_STATE
         );
     }
 }

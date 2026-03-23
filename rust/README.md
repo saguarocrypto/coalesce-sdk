@@ -140,6 +140,7 @@ let create_market_ix = create_create_market_instruction(
         blacklist_check: blacklist_check.address,
         system_program: system_program::id(),
         token_program: spl_token::id(),
+        haircut_state: find_haircut_state_pda(&pdas.market.address, &program_id).address,
     },
     CreateMarketArgs {
         market_nonce,

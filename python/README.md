@@ -128,6 +128,7 @@ create_market_ix = create_create_market_instruction(
         "blacklist_check": blacklist_check,
         "system_program": SYSTEM_PROGRAM_ID,
         "token_program": SPL_TOKEN_PROGRAM_ID,
+        "haircut_state": find_haircut_state_pda(pdas.market.address, program_id)[0],
     },
     args={
         "market_nonce": market_nonce,

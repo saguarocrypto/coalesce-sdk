@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Rust SDK for CoalesceFi lending protocol"
 license = "Apache-2.0"
-repository = "https://github.com/saguarocrypto/coalesce-sdk"
+repository = "https://github.com/saguarocrypto/coalesce"
 readme = "README.md"
 keywords = ["solana", "defi", "lending", "coalescefi"]
 categories = ["cryptography::cryptocurrencies"]
@@ -16,13 +16,15 @@ categories = ["cryptography::cryptocurrencies"]
 # compilation errors or unexpected behavior.
 [features]
 default = ["std"]
-std = ["solana-sdk/full", "solana-client", "thiserror/std"]
+std = ["solana-sdk/full", "solana-client", "spl-associated-token-account", "thiserror/std"]
 no-std = []
 
 [dependencies]
 solana-program = "2.0"
 solana-sdk = { version = "2.0", optional = true, default-features = false }
 solana-client = { version = "2.0", optional = true }
+spl-associated-token-account = { version = "5.0", optional = true, features = ["no-entrypoint"] }
+spl-token = { version = "6.0", features = ["no-entrypoint"] }
 bytemuck = { version = "1.19", features = ["derive"] }
 thiserror = { version = "2.0", default-features = false }
 

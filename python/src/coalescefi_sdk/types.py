@@ -74,13 +74,14 @@ class Market:
     scaled_total_supply: int  # u128: Sum of lender scaled balances
     scale_factor: int  # u128: WAD precision scale factor
     accrued_protocol_fees: int  # u64: Uncollected fees
-    total_deposited: int  # u64: Running total deposits
+    total_deposited: int  # u64: Capacity tracker (+deposits, -withdraw payouts)
     total_borrowed: int  # u64: Running total borrowed
     total_repaid: int  # u64: Running total repaid
     total_interest_repaid: int  # u64: Running total interest repaid
     last_accrual_timestamp: int  # i64: Last interest accrual timestamp
     settlement_factor_wad: int  # u128: Payout ratio at settlement
     bump: int  # u8: Market PDA bump
+    haircut_accumulator: int  # u64: Cumulative distressed withdrawal gap
 
 
 @dataclass(frozen=True)
@@ -95,6 +96,8 @@ class LenderPosition:
     lender: Pubkey  # 32 bytes: Lender wallet address
     scaled_balance: int  # u128: Lender's share balance
     bump: int  # u8: PDA bump
+    haircut_owed: int  # u64: Haircut recovery owed to lender
+    withdrawal_sf: int  # u128: Settlement factor snapshot at withdrawal
 
 
 @dataclass(frozen=True)
@@ -109,6 +112,20 @@ class BorrowerWhitelist:
     is_whitelisted: bool  # 1 = whitelisted, 0 = removed
     max_borrow_capacity: int  # u64: Maximum USDC that can be outstanding
     current_borrowed: int  # u64: Current outstanding USDC debt
+    bump: int  # u8: PDA bump
+
+
+@dataclass(frozen=True)
+class HaircutState:
+    """
+    HaircutState account structure (88 bytes).
+    Matches the Rust #[repr(C)] struct exactly.
+    """
+
+    version: int  # u8: Account schema version
+    market: Pubkey  # 32 bytes: Market this state belongs to
+    claim_weight_sum: int  # u128: Sum of claim weights
+    claim_offset_sum: int  # u128: Sum of claim offsets
     bump: int  # u8: PDA bump
 
 
@@ -312,6 +329,7 @@ class WithdrawAccounts:
     blacklist_check: Pubkey
     protocol_config: Pubkey
     token_program: Pubkey
+    haircut_state: Pubkey
 
 
 @dataclass(frozen=True)
@@ -345,6 +363,7 @@ class ReSettleAccounts:
     market: Pubkey
     vault: Pubkey
     protocol_config: Pubkey
+    haircut_state: Pubkey
 
 
 @dataclass(frozen=True)
@@ -403,6 +422,52 @@ class WithdrawExcessAccounts:
     market_authority: Pubkey
     token_program: Pubkey
     protocol_config: Pubkey
+    blacklist_check: Pubkey
+
+
+@dataclass(frozen=True)
+class ForceClosePositionAccounts:
+    """Accounts for ForceClosePosition instruction."""
+
+    market: Pubkey
+    borrower: Pubkey
+    lender_position: Pubkey
+    vault: Pubkey
+    escrow_token_account: Pubkey
+    market_authority: Pubkey
+    protocol_config: Pubkey
+    token_program: Pubkey
+    haircut_state: Pubkey
+
+
+@dataclass(frozen=True)
+class ClaimHaircutAccounts:
+    """Accounts for ClaimHaircut instruction."""
+
+    market: Pubkey
+    lender: Pubkey
+    lender_token_account: Pubkey
+    vault: Pubkey
+    lender_position: Pubkey
+    market_authority: Pubkey
+    haircut_state: Pubkey
+    protocol_config: Pubkey
+    token_program: Pubkey
+
+
+@dataclass(frozen=True)
+class ForceClaimHaircutAccounts:
+    """Accounts for ForceClaimHaircut instruction."""
+
+    market: Pubkey
+    borrower: Pubkey
+    lender_position: Pubkey
+    vault: Pubkey
+    escrow_token_account: Pubkey
+    market_authority: Pubkey
+    haircut_state: Pubkey
+    protocol_config: Pubkey
+    token_program: Pubkey
 
 
 # =============================================================================
@@ -418,3 +483,18 @@ class IdempotencyOptions:
     memo: str | None = None
 
 
+@dataclass
+class InstructionResult:
+    """Wrapper result for instruction creation with idempotency support."""
+
+    from typing import TYPE_CHECKING
+
+    if TYPE_CHECKING:
+        from solders.instruction import Instruction as InstructionType
+
+        instruction: InstructionType
+        memo_instruction: InstructionType | None = None
+    else:
+        instruction: object = None
+        memo_instruction: object | None = None
+    idempotency_key: str | None = None

@@ -16,6 +16,7 @@ from .constants import (
     BPF_LOADER_UPGRADEABLE_PROGRAM_ID,
     SEED_BLACKLIST,
     SEED_BORROWER_WHITELIST,
+    SEED_HAIRCUT_STATE,
     SEED_LENDER,
     SEED_MARKET,
     SEED_MARKET_AUTHORITY,
@@ -165,6 +166,25 @@ def find_borrower_whitelist_pda(
     return Pubkey.find_program_address(
         [SEED_BORROWER_WHITELIST, bytes(borrower)], resolved_program_id
     )
+
+
+def find_haircut_state_pda(
+    market: Pubkey, program_id: Pubkey | None = None
+) -> tuple[Pubkey, int]:
+    """
+    Find a HaircutState PDA.
+
+    Seeds: [SEED_HAIRCUT_STATE, market]
+
+    Args:
+        market: The market's public key.
+        program_id: The program ID. If not provided, uses the configured program ID.
+
+    Returns:
+        A tuple of (PDA address, bump seed).
+    """
+    resolved_program_id = program_id if program_id is not None else get_program_id()
+    return Pubkey.find_program_address([SEED_HAIRCUT_STATE, bytes(market)], resolved_program_id)
 
 
 def find_blacklist_check_pda(address: Pubkey, blacklist_program: Pubkey) -> tuple[Pubkey, int]:

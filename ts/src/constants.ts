@@ -3,7 +3,7 @@ import { PublicKey } from '@solana/web3.js';
 /**
  * Network identifiers for program ID resolution.
  */
-export type NetworkName = 'mainnet' | 'devnet' | 'localnet';
+export type NetworkName = 'mainnet' | 'devnet' | 'localnet' | 'staging-mainnet';
 
 /**
  * SDK configuration options.
@@ -35,6 +35,7 @@ export const DEFAULT_PROGRAM_IDS: Record<NetworkName, string> = {
   // This entry exists for forward-compatibility if a devnet-specific deployment is added later.
   devnet: 'GooseA4bSoxitTMPa4ppe2zUQ9fu4139u8pEk6x65SR',
   localnet: '2xuc7ZLcVMWkVwVoVPkmeS6n3Picycyek4wqVVy2QbGy',
+  'staging-mainnet': '11111111111111111111111111111111', // Set via COALESCEFI_PROGRAM_ID env var
 };
 
 /**
@@ -162,8 +163,115 @@ export function resolveProgramId(): PublicKey {
 }
 
 /**
+ * Cached program ID for lazy initialization.
+ * This allows the SDK to be configured before first access.
+ */
+let cachedProgramId: PublicKey | null = null;
+
+/**
+ * Program ID for CoalesceFi lending protocol.
+ *
+ * @deprecated Use `getProgramId()` instead for proper configuration support.
+ * This getter is kept for backward compatibility but will use the resolved
+ * program ID from configuration/environment on first access.
+ *
+ * IMPORTANT: This is lazily initialized on first access. Once accessed,
+ * the value is cached. If you need to change the program ID after first
+ * access, call `resetSdkConfig()` to clear the cache and then `configureSdk()`
+ * with the new configuration.
+ *
+ * @example
+ * // Recommended: Use getProgramId() for explicit resolution
+ * const programId = getProgramId();
+ *
+ * // Legacy: PROGRAM_ID works but is cached after first access
+ * const programId = PROGRAM_ID;
+ */
+export function getProgramIdLazy(): PublicKey {
+  if (cachedProgramId === null) {
+    cachedProgramId = resolveProgramId();
+  }
+  return cachedProgramId;
+}
+
+/**
+ * Clear the cached program ID.
+ * Call this after resetSdkConfig() if you need to reconfigure the SDK.
+ */
+export function clearProgramIdCache(): void {
+  cachedProgramId = null;
+}
+
+// Re-export for backward compatibility using Object.defineProperty for lazy evaluation
+// This creates a module-level constant that behaves like the old PROGRAM_ID
+// but actually resolves lazily on first access.
+const programIdHolder: { PROGRAM_ID?: PublicKey } = {};
+Object.defineProperty(programIdHolder, 'PROGRAM_ID', {
+  get: getProgramIdLazy,
+  enumerable: true,
+  configurable: false,
+});
+
+/**
+ * Program ID for CoalesceFi lending protocol.
+ *
+ * @deprecated Use `getProgramId()` instead. This constant is provided for
+ * backward compatibility and is lazily initialized on first access.
+ *
+ * WARNING: The Proxy-based implementation has been replaced with lazy
+ * initialization. The program ID is cached after first access. Use
+ * `clearProgramIdCache()` after `resetSdkConfig()` if you need to
+ * reconfigure the SDK after the program ID has been accessed.
+ */
+export const PROGRAM_ID: PublicKey = new Proxy({} as PublicKey, {
+  get(_, prop: string | symbol) {
+    const resolved = getProgramIdLazy();
+    // Handle special cases for proper PublicKey behavior
+    if (prop === 'toBuffer') {
+      return () => resolved.toBuffer();
+    }
+    if (prop === 'toBytes') {
+      return () => resolved.toBytes();
+    }
+    if (prop === 'toBase58') {
+      return () => resolved.toBase58();
+    }
+    if (prop === 'toString') {
+      return () => resolved.toString();
+    }
+    if (prop === 'toJSON') {
+      return () => resolved.toJSON();
+    }
+    if (prop === 'equals') {
+      return (other: PublicKey) => resolved.equals(other);
+    }
+    // For instanceof checks and other property access
+    const value = (resolved as unknown as Record<string | symbol, unknown>)[prop];
+    if (typeof value === 'function') {
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-return -- Proxy needs to forward method calls
+      return (value as (...args: unknown[]) => unknown).bind(resolved);
+    }
+    return value;
+  },
+  // Handle property checks (like 'in' operator)
+  has(_, prop: string | symbol) {
+    const resolved = getProgramIdLazy();
+    return prop in resolved;
+  },
+  // Handle Object.keys, for...in, etc.
+  ownKeys() {
+    const resolved = getProgramIdLazy();
+    return Reflect.ownKeys(resolved);
+  },
+  getOwnPropertyDescriptor(_, prop: string | symbol) {
+    const resolved = getProgramIdLazy();
+    return Object.getOwnPropertyDescriptor(resolved, prop);
+  },
+});
+
+/**
  * Get the program ID, resolving from configuration.
- * This is the preferred way to get the program ID.
+ * Preferred over using PROGRAM_ID directly.
  */
 export function getProgramId(): PublicKey {
   return resolveProgramId();
@@ -179,6 +287,7 @@ export const SEED_LENDER = Buffer.from('lender');
 export const SEED_VAULT = Buffer.from('vault');
 export const SEED_BORROWER_WHITELIST = Buffer.from('borrower_whitelist');
 export const SEED_BLACKLIST = Buffer.from('blacklist');
+export const SEED_HAIRCUT_STATE = Buffer.from('haircut_state');
 
 /**
  * Mathematical constants - must match the Rust program exactly.
@@ -203,6 +312,7 @@ export const PROTOCOL_CONFIG_SIZE = 194;
 export const MARKET_SIZE = 250;
 export const LENDER_POSITION_SIZE = 128;
 export const BORROWER_WHITELIST_SIZE = 96;
+export const HAIRCUT_STATE_SIZE = 88;
 
 /**
  * Account discriminators - 8-byte prefixes at the start of each account.
@@ -212,6 +322,7 @@ export const DISC_PROTOCOL_CONFIG = Buffer.from('COALPC__');
 export const DISC_MARKET = Buffer.from('COALMKT_');
 export const DISC_LENDER_POSITION = Buffer.from('COALLPOS');
 export const DISC_BORROWER_WL = Buffer.from('COALBWL_');
+export const DISC_HAIRCUT_STATE = Buffer.from('COALHCST');
 
 /**
  * Instruction discriminators for the CoalesceFi protocol.
@@ -258,6 +369,19 @@ export enum InstructionDiscriminator {
   SetBlacklistMode = 14,
   SetAdmin = 15,
   SetWhitelistManager = 16,
+
+  // Discriminator 17 is intentionally skipped (reserved).
+
+  // ═══════════════════════════════════════════════════════════════
+  // FORCE CLOSE (18)
+  // ═══════════════════════════════════════════════════════════════
+  ForceClosePosition = 18,
+
+  // ═══════════════════════════════════════════════════════════════
+  // HAIRCUT RECOVERY (19-20)
+  // ═══════════════════════════════════════════════════════════════
+  ClaimHaircut = 19,
+  ForceClaimHaircut = 20,
 }
 
 /**
@@ -266,3 +390,13 @@ export enum InstructionDiscriminator {
 export const SPL_TOKEN_PROGRAM_ID = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
 export const SYSTEM_PROGRAM_ID = new PublicKey('11111111111111111111111111111111');
 
+/**
+ * Network-specific program IDs.
+ * @deprecated Use `configureSdk()` or environment variables instead.
+ */
+export const PROGRAM_IDS = {
+  mainnet: new PublicKey(DEFAULT_PROGRAM_IDS.mainnet),
+  devnet: new PublicKey(DEFAULT_PROGRAM_IDS.devnet),
+  localnet: new PublicKey(DEFAULT_PROGRAM_IDS.localnet),
+  'staging-mainnet': new PublicKey(DEFAULT_PROGRAM_IDS['staging-mainnet']),
+} as const;

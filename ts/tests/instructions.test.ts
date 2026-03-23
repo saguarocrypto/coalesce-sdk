@@ -26,6 +26,7 @@ import {
   createWithdrawInstructionWithIdempotency,
   createWaterfallRepayInstructions,
   createWithdrawExcessInstruction,
+  createForceClosePositionInstruction,
   generateIdempotencyKey,
   createDeterministicIdempotencyKey,
   validateU64,
@@ -119,7 +120,7 @@ describe('Instruction Builders', () => {
   });
 
   describe('createCreateMarketInstruction', () => {
-    it('should create instruction with 10 accounts in correct order', () => {
+    it('should create instruction with 11 accounts in correct order', () => {
       const accounts = {
         market: Keypair.generate().publicKey,
         borrower: Keypair.generate().publicKey,
@@ -131,6 +132,7 @@ describe('Instruction Builders', () => {
         blacklistCheck: Keypair.generate().publicKey,
         systemProgram: SystemProgram.programId,
         tokenProgram: SPL_TOKEN_PROGRAM_ID,
+        haircutState: Keypair.generate().publicKey,
       };
 
       const args = {
@@ -143,12 +145,13 @@ describe('Instruction Builders', () => {
       const ix = createCreateMarketInstruction(accounts, args, testProgramId);
 
       expect(ix.data[0]).toBe(InstructionDiscriminator.CreateMarket);
-      expect(ix.keys.length).toBe(10);
+      expect(ix.keys.length).toBe(11);
       // Verify order: market(0), borrower(1), mint(2), vault(3), ...
       expect(ix.keys[0]?.pubkey.equals(accounts.market)).toBe(true);
       expect(ix.keys[1]?.pubkey.equals(accounts.borrower)).toBe(true);
       expect(ix.keys[1]?.isSigner).toBe(true);
       expect(ix.keys[7]?.pubkey.equals(accounts.blacklistCheck)).toBe(true);
+      expect(ix.keys[10]?.pubkey.equals(accounts.haircutState)).toBe(true);
     });
   });
 
@@ -278,7 +281,7 @@ describe('Instruction Builders', () => {
   });
 
   describe('createWithdrawInstruction', () => {
-    it('should create instruction with correct discriminator and 9 accounts', () => {
+    it('should create instruction with correct discriminator and 10 accounts', () => {
       const accounts = {
         market: Keypair.generate().publicKey,
         lender: Keypair.generate().publicKey,
@@ -289,6 +292,7 @@ describe('Instruction Builders', () => {
         blacklistCheck: Keypair.generate().publicKey,
         protocolConfig: Keypair.generate().publicKey,
         tokenProgram: SPL_TOKEN_PROGRAM_ID,
+        haircutState: Keypair.generate().publicKey,
       };
 
       const ix = createWithdrawInstruction(
@@ -298,7 +302,7 @@ describe('Instruction Builders', () => {
       );
 
       expect(ix.data[0]).toBe(InstructionDiscriminator.Withdraw);
-      expect(ix.keys.length).toBe(9);
+      expect(ix.keys.length).toBe(10);
       expect(ix.keys[0]?.pubkey.equals(accounts.market)).toBe(true);
       expect(ix.keys[6]?.pubkey.equals(accounts.blacklistCheck)).toBe(true);
     });
@@ -314,6 +318,7 @@ describe('Instruction Builders', () => {
         blacklistCheck: Keypair.generate().publicKey,
         protocolConfig: Keypair.generate().publicKey,
         tokenProgram: SPL_TOKEN_PROGRAM_ID,
+        haircutState: Keypair.generate().publicKey,
       };
 
       const scaledAmount = BigInt('123456789012345678901234567890');
@@ -373,21 +378,23 @@ describe('Instruction Builders', () => {
   });
 
   describe('createReSettleInstruction', () => {
-    it('should create instruction with correct discriminator and 3 accounts, no args', () => {
+    it('should create instruction with correct discriminator and 4 accounts, no args', () => {
       const accounts = {
         market: Keypair.generate().publicKey,
         vault: Keypair.generate().publicKey,
         protocolConfig: Keypair.generate().publicKey,
+        haircutState: Keypair.generate().publicKey,
       };
 
       const ix = createReSettleInstruction(accounts, testProgramId);
 
       expect(ix.data[0]).toBe(InstructionDiscriminator.ReSettle);
       expect(ix.data.length).toBe(1); // discriminator only
-      expect(ix.keys.length).toBe(3);
+      expect(ix.keys.length).toBe(4);
       expect(ix.keys[0]?.pubkey.equals(accounts.market)).toBe(true);
       expect(ix.keys[1]?.pubkey.equals(accounts.vault)).toBe(true);
       expect(ix.keys[2]?.pubkey.equals(accounts.protocolConfig)).toBe(true);
+      expect(ix.keys[3]?.pubkey.equals(accounts.haircutState)).toBe(true);
     });
   });
 
@@ -559,7 +566,7 @@ describe('Instruction Builders', () => {
   });
 
   describe('createWithdrawExcessInstruction', () => {
-    it('should create instruction with correct discriminator and 7 accounts', () => {
+    it('should create instruction with correct discriminator and 9 accounts', () => {
       const accounts = {
         market: Keypair.generate().publicKey,
         borrower: Keypair.generate().publicKey,
@@ -568,13 +575,15 @@ describe('Instruction Builders', () => {
         marketAuthority: Keypair.generate().publicKey,
         tokenProgram: SPL_TOKEN_PROGRAM_ID,
         protocolConfig: Keypair.generate().publicKey,
+        blacklistCheck: Keypair.generate().publicKey,
+        borrowerWhitelist: Keypair.generate().publicKey,
       };
 
       const ix = createWithdrawExcessInstruction(accounts, testProgramId);
 
       expect(ix.data[0]).toBe(InstructionDiscriminator.WithdrawExcess);
       expect(ix.data.length).toBe(1); // discriminator only
-      expect(ix.keys.length).toBe(7);
+      expect(ix.keys.length).toBe(9);
       expect(ix.keys[0]?.pubkey.equals(accounts.market)).toBe(true);
       expect(ix.keys[0]?.isWritable).toBe(false);
       expect(ix.keys[1]?.pubkey.equals(accounts.borrower)).toBe(true);
@@ -587,6 +596,46 @@ describe('Instruction Builders', () => {
       expect(ix.keys[5]?.pubkey.equals(accounts.tokenProgram)).toBe(true);
       expect(ix.keys[6]?.pubkey.equals(accounts.protocolConfig)).toBe(true);
       expect(ix.keys[6]?.isWritable).toBe(false);
+      expect(ix.keys[7]?.pubkey.equals(accounts.blacklistCheck)).toBe(true);
+      expect(ix.keys[7]?.isWritable).toBe(false);
+    });
+  });
+
+  describe('createForceClosePositionInstruction', () => {
+    it('should create instruction with correct discriminator and 9 accounts', () => {
+      const accounts = {
+        market: Keypair.generate().publicKey,
+        borrower: Keypair.generate().publicKey,
+        lenderPosition: Keypair.generate().publicKey,
+        vault: Keypair.generate().publicKey,
+        escrowTokenAccount: Keypair.generate().publicKey,
+        marketAuthority: Keypair.generate().publicKey,
+        protocolConfig: Keypair.generate().publicKey,
+        tokenProgram: SPL_TOKEN_PROGRAM_ID,
+        haircutState: Keypair.generate().publicKey,
+      };
+
+      const ix = createForceClosePositionInstruction(accounts, testProgramId);
+
+      expect(ix.data[0]).toBe(InstructionDiscriminator.ForceClosePosition);
+      expect(ix.data.length).toBe(1); // discriminator only
+      expect(ix.keys.length).toBe(9);
+      expect(ix.keys[0]?.pubkey.equals(accounts.market)).toBe(true);
+      expect(ix.keys[0]?.isWritable).toBe(true);
+      expect(ix.keys[1]?.pubkey.equals(accounts.borrower)).toBe(true);
+      expect(ix.keys[1]?.isSigner).toBe(true);
+      expect(ix.keys[2]?.pubkey.equals(accounts.lenderPosition)).toBe(true);
+      expect(ix.keys[2]?.isWritable).toBe(true);
+      expect(ix.keys[3]?.pubkey.equals(accounts.vault)).toBe(true);
+      expect(ix.keys[3]?.isWritable).toBe(true);
+      expect(ix.keys[4]?.pubkey.equals(accounts.escrowTokenAccount)).toBe(true);
+      expect(ix.keys[4]?.isWritable).toBe(true);
+      expect(ix.keys[5]?.pubkey.equals(accounts.marketAuthority)).toBe(true);
+      expect(ix.keys[5]?.isWritable).toBe(false);
+      expect(ix.keys[6]?.pubkey.equals(accounts.protocolConfig)).toBe(true);
+      expect(ix.keys[6]?.isWritable).toBe(false);
+      expect(ix.keys[7]?.pubkey.equals(accounts.tokenProgram)).toBe(true);
+      expect(ix.keys[7]?.isWritable).toBe(false);
     });
   });
 
@@ -795,6 +844,7 @@ describe('Instruction Builders', () => {
         blacklistCheck: Keypair.generate().publicKey,
         systemProgram: SystemProgram.programId,
         tokenProgram: SPL_TOKEN_PROGRAM_ID,
+        haircutState: Keypair.generate().publicKey,
       };
 
       it('should reject negative interest rate', () => {

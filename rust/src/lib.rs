@@ -62,6 +62,10 @@ pub mod errors;
 #[cfg(any(feature = "std", feature = "no-std"))]
 pub mod instructions;
 
+#[cfg(feature = "std")]
+pub mod client;
+
+pub mod math;
 pub mod pdas;
 pub mod types;
 
@@ -72,10 +76,10 @@ pub use constants::{
 };
 pub use errors::CoalescefiError;
 pub use pdas::{
-    derive_market_pdas, find_borrower_whitelist_pda, find_lender_position_pda, find_market_pda,
-    find_protocol_config_pda, find_vault_pda, PdaResult,
+    derive_market_pdas, find_borrower_whitelist_pda, find_haircut_state_pda,
+    find_lender_position_pda, find_market_pda, find_protocol_config_pda, find_vault_pda, PdaResult,
 };
-pub use types::{BorrowerWhitelist, LenderPosition, Market, ProtocolConfig};
+pub use types::{BorrowerWhitelist, HaircutState, LenderPosition, Market, ProtocolConfig};
 
 /// Prelude module for convenient imports.
 ///
@@ -84,8 +88,8 @@ pub use types::{BorrowerWhitelist, LenderPosition, Market, ProtocolConfig};
 /// ```
 pub mod prelude {
     pub use crate::accounts::{
-        decode_account, decode_borrower_whitelist, decode_lender_position, decode_market,
-        decode_protocol_config, AccountType, DecodedAccount,
+        decode_account, decode_borrower_whitelist, decode_haircut_state, decode_lender_position,
+        decode_market, decode_protocol_config, AccountType, DecodedAccount,
     };
     pub use crate::constants::{
         devnet_program_id, localnet_program_id, mainnet_program_id, InstructionDiscriminator, BPS,
@@ -96,21 +100,22 @@ pub mod prelude {
     pub use crate::instructions::*;
     pub use crate::pdas::{
         derive_market_pdas, find_blacklist_check_pda, find_borrower_whitelist_pda,
-        find_lender_position_pda, find_market_authority_pda, find_market_pda,
-        find_program_data_pda, find_protocol_config_pda, find_vault_pda, MarketPdas, PdaResult,
+        find_haircut_state_pda, find_lender_position_pda, find_market_authority_pda,
+        find_market_pda, find_program_data_pda, find_protocol_config_pda, find_vault_pda,
+        MarketPdas, PdaResult,
     };
     pub use crate::types::{
-        BorrowArgs, BorrowerWhitelist, CreateMarketArgs, DepositArgs, InitializeProtocolArgs,
-        LenderPosition, Market, ProtocolConfig, RepayArgs, RepayInterestArgs,
-        SetBlacklistModeArgs, SetBorrowerWhitelistArgs, SetFeeConfigArgs, SetPauseArgs,
-        WithdrawArgs,
+        BorrowArgs, BorrowerWhitelist, CreateMarketArgs, DepositArgs, HaircutState,
+        InitializeProtocolArgs, LenderPosition, Market, ProtocolConfig, RepayArgs,
+        RepayInterestArgs, SetBlacklistModeArgs, SetBorrowerWhitelistArgs, SetFeeConfigArgs,
+        SetPauseArgs, WithdrawArgs,
     };
 
     #[cfg(feature = "std")]
     pub use crate::accounts::{
-        fetch_borrower_whitelist, fetch_lender_position, fetch_market, fetch_protocol_config,
-        try_fetch_borrower_whitelist, try_fetch_lender_position, try_fetch_market,
-        try_fetch_protocol_config,
+        fetch_borrower_whitelist, fetch_haircut_state, fetch_lender_position, fetch_market,
+        fetch_protocol_config, try_fetch_borrower_whitelist, try_fetch_haircut_state,
+        try_fetch_lender_position, try_fetch_market, try_fetch_protocol_config,
     };
     #[cfg(feature = "std")]
     pub use crate::errors::parse_error_code;

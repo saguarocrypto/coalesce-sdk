@@ -20,14 +20,16 @@ from solders.pubkey import Pubkey
 from .constants import (
     BORROWER_WHITELIST_SIZE,
     DISC_BORROWER_WL,
+    DISC_HAIRCUT_STATE,
     DISC_LENDER_POSITION,
     DISC_MARKET,
     DISC_PROTOCOL_CONFIG,
+    HAIRCUT_STATE_SIZE,
     LENDER_POSITION_SIZE,
     MARKET_SIZE,
     PROTOCOL_CONFIG_SIZE,
 )
-from .types import BorrowerWhitelist, LenderPosition, Market, ProtocolConfig
+from .types import BorrowerWhitelist, HaircutState, LenderPosition, Market, ProtocolConfig
 
 # =============================================================================
 # Retry Configuration
@@ -215,7 +217,8 @@ def decode_market(data: bytes) -> Market:
     - last_accrual_timestamp: [u8; 8]       (204-211)
     - settlement_factor_wad: [u8; 16]       (212-227)
     - bump: u8                              (228)
-    - _padding: [u8; 21]                    (229-249)
+    - haircut_accumulator: [u8; 8]          (229-236)
+    - _padding: [u8; 13]                    (237-249)
 
     Args:
         data: Raw account data bytes.
@@ -251,6 +254,7 @@ def decode_market(data: bytes) -> Market:
         last_accrual_timestamp=_read_i64_le(data, 204),
         settlement_factor_wad=_read_u128_le(data, 212),
         bump=_read_u8(data, 228),
+        haircut_accumulator=_read_u64_le(data, 229),
     )
 
 
@@ -265,7 +269,9 @@ def decode_lender_position(data: bytes) -> LenderPosition:
     - lender: [u8; 32]            (41-72)
     - scaled_balance: [u8; 16]    (73-88)
     - bump: u8                    (89)
-    - _padding: [u8; 38]          (90-127)
+    - haircut_owed: [u8; 8]       (90-97)
+    - withdrawal_sf: [u8; 16]     (98-113)
+    - _padding: [u8; 14]          (114-127)
 
     Args:
         data: Raw account data bytes.
@@ -289,6 +295,8 @@ def decode_lender_position(data: bytes) -> LenderPosition:
         lender=_read_pubkey(data, 41),
         scaled_balance=_read_u128_le(data, 73),
         bump=_read_u8(data, 89),
+        haircut_owed=_read_u64_le(data, 90),
+        withdrawal_sf=_read_u128_le(data, 98),
     )
 
 
@@ -330,6 +338,44 @@ def decode_borrower_whitelist(data: bytes) -> BorrowerWhitelist:
         max_borrow_capacity=_read_u64_le(data, 42),
         current_borrowed=_read_u64_le(data, 50),
         bump=_read_u8(data, 58),
+    )
+
+
+def decode_haircut_state(data: bytes) -> HaircutState:
+    """
+    Decode a HaircutState account from raw bytes.
+
+    Layout (88 bytes):
+    - discriminator: [u8; 8]          (0-7)
+    - version: u8                     (8)
+    - market: [u8; 32]                (9-40)
+    - claim_weight_sum: [u8; 16]      (41-56)
+    - claim_offset_sum: [u8; 16]      (57-72)
+    - bump: u8                        (73)
+    - _padding: [u8; 14]              (74-87)
+
+    Args:
+        data: Raw account data bytes.
+
+    Returns:
+        Decoded HaircutState.
+
+    Raises:
+        ValueError: If data is invalid.
+    """
+    if len(data) < HAIRCUT_STATE_SIZE:
+        raise ValueError(
+            f"Invalid HaircutState data length: expected {HAIRCUT_STATE_SIZE}, got {len(data)}"
+        )
+
+    _check_discriminator(data, DISC_HAIRCUT_STATE, "HaircutState")
+
+    return HaircutState(
+        version=_read_u8(data, 8),
+        market=_read_pubkey(data, 9),
+        claim_weight_sum=_read_u128_le(data, 41),
+        claim_offset_sum=_read_u128_le(data, 57),
+        bump=_read_u8(data, 73),
     )
 
 
@@ -446,11 +492,38 @@ async def fetch_borrower_whitelist(
     return await _with_retry(_fetch, retry_config)
 
 
+async def fetch_haircut_state(
+    connection: AsyncClient,
+    address: Pubkey,
+    retry_config: RetryConfig | None = None,
+) -> HaircutState | None:
+    """
+    Fetch and decode a HaircutState account.
+    Uses exponential backoff retry for resilience against transient RPC failures.
+
+    Args:
+        connection: Solana RPC connection.
+        address: The account address.
+        retry_config: Optional retry configuration.
+
+    Returns:
+        Decoded HaircutState or None if account doesn't exist.
+    """
+
+    async def _fetch() -> HaircutState | None:
+        resp = await connection.get_account_info(address)
+        if resp.value is None:
+            return None
+        return decode_haircut_state(bytes(resp.value.data))
+
+    return await _with_retry(_fetch, retry_config)
+
+
 # =============================================================================
 # Account Type Detection
 # =============================================================================
 
-AccountType = Literal["ProtocolConfig", "Market", "LenderPosition", "BorrowerWhitelist"]
+AccountType = Literal["ProtocolConfig", "Market", "LenderPosition", "BorrowerWhitelist", "HaircutState"]
 
 
 def get_account_type(data_length: int) -> AccountType | None:
@@ -471,12 +544,14 @@ def get_account_type(data_length: int) -> AccountType | None:
         return "LenderPosition"
     elif data_length == BORROWER_WHITELIST_SIZE:
         return "BorrowerWhitelist"
+    elif data_length == HAIRCUT_STATE_SIZE:
+        return "HaircutState"
     return None
 
 
 def decode_account(
     data: bytes,
-) -> ProtocolConfig | Market | LenderPosition | BorrowerWhitelist | None:
+) -> ProtocolConfig | Market | LenderPosition | BorrowerWhitelist | HaircutState | None:
     """
     Decode any CoalesceFi account from raw data.
 
@@ -495,4 +570,6 @@ def decode_account(
         return decode_lender_position(data)
     elif account_type == "BorrowerWhitelist":
         return decode_borrower_whitelist(data)
+    elif account_type == "HaircutState":
+        return decode_haircut_state(data)
     return None

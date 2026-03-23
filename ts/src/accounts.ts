@@ -5,16 +5,19 @@ import {
   MARKET_SIZE,
   LENDER_POSITION_SIZE,
   BORROWER_WHITELIST_SIZE,
+  HAIRCUT_STATE_SIZE,
   DISC_PROTOCOL_CONFIG,
   DISC_MARKET,
   DISC_LENDER_POSITION,
   DISC_BORROWER_WL,
+  DISC_HAIRCUT_STATE,
 } from './constants';
 import {
   type ProtocolConfig,
   type Market,
   type LenderPosition,
   type BorrowerWhitelist,
+  type HaircutState,
 } from './types';
 
 /**
@@ -219,7 +222,8 @@ export function decodeProtocolConfig(data: Uint8Array): ProtocolConfig {
  * - last_accrual_timestamp: [u8; 8]       (204-211)
  * - settlement_factor_wad: [u8; 16]       (212-227)
  * - bump: u8                              (228)
- * - _padding: [u8; 21]                    (229-249)
+ * - haircut_accumulator: [u8; 8]          (229-236)
+ * - _padding: [u8; 13]                    (237-249)
  */
 export function decodeMarket(data: Uint8Array): Market {
   if (data.length < MARKET_SIZE) {
@@ -248,6 +252,7 @@ export function decodeMarket(data: Uint8Array): Market {
     lastAccrualTimestamp: readI64LE(data, 204),
     settlementFactorWad: readU128LE(data, 212),
     bump: data[228] ?? 0,
+    haircutAccumulator: readU64LE(data, 229),
   };
 }
 
@@ -261,7 +266,9 @@ export function decodeMarket(data: Uint8Array): Market {
  * - lender: [u8; 32]            (41-72)
  * - scaled_balance: [u8; 16]    (73-88)
  * - bump: u8                    (89)
- * - _padding: [u8; 38]          (90-127)
+ * - haircut_owed: [u8; 8]       (90-97)
+ * - withdrawal_sf: [u8; 16]     (98-113)
+ * - _padding: [u8; 14]          (114-127)
  */
 export function decodeLenderPosition(data: Uint8Array): LenderPosition {
   if (data.length < LENDER_POSITION_SIZE) {
@@ -278,6 +285,8 @@ export function decodeLenderPosition(data: Uint8Array): LenderPosition {
     lender: readPublicKey(data, 41),
     scaledBalance: readU128LE(data, 73),
     bump: data[89] ?? 0,
+    haircutOwed: readU64LE(data, 90),
+    withdrawalSf: readU128LE(data, 98),
   };
 }
 
@@ -311,6 +320,54 @@ export function decodeBorrowerWhitelist(data: Uint8Array): BorrowerWhitelist {
     currentBorrowed: readU64LE(data, 50),
     bump: data[58] ?? 0,
   };
+}
+
+/**
+ * Decode a HaircutState account from raw bytes.
+ *
+ * Layout (88 bytes):
+ * - discriminator: [u8; 8]          (0-7)
+ * - version: u8                     (8)
+ * - market: [u8; 32]                (9-40)
+ * - claim_weight_sum: [u8; 16]      (41-56)
+ * - claim_offset_sum: [u8; 16]      (57-72)
+ * - bump: u8                        (73)
+ * - _padding: [u8; 14]              (74-87)
+ */
+export function decodeHaircutState(data: Uint8Array): HaircutState {
+  if (data.length < HAIRCUT_STATE_SIZE) {
+    throw new Error(
+      `Invalid HaircutState data length: expected ${HAIRCUT_STATE_SIZE}, got ${data.length}`
+    );
+  }
+
+  checkDiscriminator(data, DISC_HAIRCUT_STATE, 'HaircutState');
+
+  return {
+    version: data[8] ?? 0,
+    market: readPublicKey(data, 9),
+    claimWeightSum: readU128LE(data, 41),
+    claimOffsetSum: readU128LE(data, 57),
+    bump: data[73] ?? 0,
+  };
+}
+
+/**
+ * Fetch and decode a HaircutState account.
+ * Uses exponential backoff retry for resilience against transient RPC failures.
+ */
+export async function fetchHaircutState(
+  connection: Connection,
+  address: PublicKey,
+  retryConfig?: RetryConfig
+): Promise<HaircutState | null> {
+  return withRetry(async () => {
+    const accountInfo = await connection.getAccountInfo(address);
+    if (!accountInfo) {
+      return null;
+    }
+    return decodeHaircutState(accountInfo.data);
+  }, retryConfig);
 }
 
 /**
@@ -388,7 +445,12 @@ export async function fetchBorrowerWhitelist(
 /**
  * Determine account type from data length.
  */
-export type AccountType = 'ProtocolConfig' | 'Market' | 'LenderPosition' | 'BorrowerWhitelist';
+export type AccountType =
+  | 'ProtocolConfig'
+  | 'Market'
+  | 'LenderPosition'
+  | 'BorrowerWhitelist'
+  | 'HaircutState';
 
 export function getAccountType(dataLength: number): AccountType | null {
   switch (dataLength) {
@@ -400,6 +462,8 @@ export function getAccountType(dataLength: number): AccountType | null {
       return 'LenderPosition';
     case BORROWER_WHITELIST_SIZE:
       return 'BorrowerWhitelist';
+    case HAIRCUT_STATE_SIZE:
+      return 'HaircutState';
     default:
       return null;
   }
@@ -410,7 +474,7 @@ export function getAccountType(dataLength: number): AccountType | null {
  */
 export function decodeAccount(
   data: Uint8Array
-): ProtocolConfig | Market | LenderPosition | BorrowerWhitelist | null {
+): ProtocolConfig | Market | LenderPosition | BorrowerWhitelist | HaircutState | null {
   const accountType = getAccountType(data.length);
   switch (accountType) {
     case 'ProtocolConfig':
@@ -421,6 +485,8 @@ export function decodeAccount(
       return decodeLenderPosition(data);
     case 'BorrowerWhitelist':
       return decodeBorrowerWhitelist(data);
+    case 'HaircutState':
+      return decodeHaircutState(data);
     default:
       return null;
   }

@@ -24,7 +24,9 @@ pub const PROGRAM_ID_LOCALNET: &str = "2xuc7ZLcVMWkVwVoVPkmeS6n3Picycyek4wqVVy2Q
 
 /// Get the mainnet program ID as a [`Pubkey`].
 pub fn mainnet_program_id() -> Pubkey {
-    PROGRAM_ID_MAINNET.parse().expect("Invalid mainnet program ID")
+    PROGRAM_ID_MAINNET
+        .parse()
+        .expect("Invalid mainnet program ID")
 }
 
 /// Get the devnet program ID as a [`Pubkey`].
@@ -32,12 +34,16 @@ pub fn mainnet_program_id() -> Pubkey {
 /// **Note:** Currently returns the same address as [`mainnet_program_id()`].
 /// See [`PROGRAM_ID_DEVNET`] for details.
 pub fn devnet_program_id() -> Pubkey {
-    PROGRAM_ID_DEVNET.parse().expect("Invalid devnet program ID")
+    PROGRAM_ID_DEVNET
+        .parse()
+        .expect("Invalid devnet program ID")
 }
 
 /// Get the localnet program ID as a [`Pubkey`].
 pub fn localnet_program_id() -> Pubkey {
-    PROGRAM_ID_LOCALNET.parse().expect("Invalid localnet program ID")
+    PROGRAM_ID_LOCALNET
+        .parse()
+        .expect("Invalid localnet program ID")
 }
 
 // ============================================================================
@@ -65,6 +71,9 @@ pub const SEED_BORROWER_WHITELIST: &[u8] = b"borrower_whitelist";
 /// Seed for Blacklist check PDA derivation.
 pub const SEED_BLACKLIST: &[u8] = b"blacklist";
 
+/// Seed for HaircutState PDA derivation.
+pub const SEED_HAIRCUT_STATE: &[u8] = b"haircut_state";
+
 // ============================================================================
 // Account Discriminators - 8-byte prefixes for each account type
 // ============================================================================
@@ -81,6 +90,9 @@ pub const DISC_LENDER_POSITION: &[u8; 8] = b"COALLPOS";
 /// Discriminator for BorrowerWhitelist accounts.
 pub const DISC_BORROWER_WL: &[u8; 8] = b"COALBWL_";
 
+/// Discriminator for HaircutState accounts.
+pub const DISC_HAIRCUT_STATE: &[u8; 8] = b"COALHCST";
+
 // ============================================================================
 // Account Sizes - Must match the Rust #[repr(C)] structs exactly
 // ============================================================================
@@ -96,6 +108,9 @@ pub const LENDER_POSITION_SIZE: usize = 128;
 
 /// Size of BorrowerWhitelist account in bytes.
 pub const BORROWER_WHITELIST_SIZE: usize = 96;
+
+/// Size of HaircutState account in bytes.
+pub const HAIRCUT_STATE_SIZE: usize = 88;
 
 // ============================================================================
 // Mathematical Constants
@@ -180,6 +195,16 @@ pub enum InstructionDiscriminator {
     SetAdmin = 15,
     /// Set whitelist manager.
     SetWhitelistManager = 16,
+
+    // FORCE-CLOSE (18)
+    /// Force-close a lender position after maturity + grace period (borrower only).
+    ForceClosePosition = 18,
+
+    // HAIRCUT RECOVERY (19-20)
+    /// Claim haircut recovery tokens (lender only).
+    ClaimHaircut = 19,
+    /// Force-claim haircut recovery on behalf of a lender (borrower only).
+    ForceClaimHaircut = 20,
 }
 
 impl InstructionDiscriminator {
@@ -208,6 +233,9 @@ impl InstructionDiscriminator {
             14 => Some(Self::SetBlacklistMode),
             15 => Some(Self::SetAdmin),
             16 => Some(Self::SetWhitelistManager),
+            18 => Some(Self::ForceClosePosition),
+            19 => Some(Self::ClaimHaircut),
+            20 => Some(Self::ForceClaimHaircut),
             _ => None,
         }
     }
@@ -228,17 +256,23 @@ pub const BPF_LOADER_UPGRADEABLE_PROGRAM_ID: &str = "BPFLoaderUpgradeab1e1111111
 
 /// Get the SPL Token Program ID as a Pubkey.
 pub fn spl_token_program_id() -> Pubkey {
-    SPL_TOKEN_PROGRAM_ID.parse().expect("Invalid SPL Token program ID")
+    SPL_TOKEN_PROGRAM_ID
+        .parse()
+        .expect("Invalid SPL Token program ID")
 }
 
 /// Get the System Program ID as a Pubkey.
 pub fn system_program_id() -> Pubkey {
-    SYSTEM_PROGRAM_ID.parse().expect("Invalid System program ID")
+    SYSTEM_PROGRAM_ID
+        .parse()
+        .expect("Invalid System program ID")
 }
 
 /// Get the BPF Loader Upgradeable Program ID as a Pubkey.
 pub fn bpf_loader_upgradeable_program_id() -> Pubkey {
-    BPF_LOADER_UPGRADEABLE_PROGRAM_ID.parse().expect("Invalid BPF Loader program ID")
+    BPF_LOADER_UPGRADEABLE_PROGRAM_ID
+        .parse()
+        .expect("Invalid BPF Loader program ID")
 }
 
 #[cfg(test)]
@@ -252,6 +286,13 @@ mod tests {
             assert_eq!(disc.to_u8(), i);
         }
         assert!(InstructionDiscriminator::from_u8(17).is_none());
+        let fc = InstructionDiscriminator::from_u8(18).unwrap();
+        assert_eq!(fc.to_u8(), 18);
+        let ch = InstructionDiscriminator::from_u8(19).unwrap();
+        assert_eq!(ch.to_u8(), 19);
+        let fch = InstructionDiscriminator::from_u8(20).unwrap();
+        assert_eq!(fch.to_u8(), 20);
+        assert!(InstructionDiscriminator::from_u8(21).is_none());
     }
 
     #[test]
@@ -263,6 +304,7 @@ mod tests {
         assert_eq!(SEED_VAULT, b"vault");
         assert_eq!(SEED_BORROWER_WHITELIST, b"borrower_whitelist");
         assert_eq!(SEED_BLACKLIST, b"blacklist");
+        assert_eq!(SEED_HAIRCUT_STATE, b"haircut_state");
     }
 
     #[test]
@@ -271,6 +313,7 @@ mod tests {
         assert_eq!(DISC_MARKET.len(), 8);
         assert_eq!(DISC_LENDER_POSITION.len(), 8);
         assert_eq!(DISC_BORROWER_WL.len(), 8);
+        assert_eq!(DISC_HAIRCUT_STATE.len(), 8);
     }
 
     #[test]

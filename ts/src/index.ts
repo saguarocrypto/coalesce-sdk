@@ -4,10 +4,10 @@
  * TypeScript SDK for interacting with the CoalesceFi lending protocol on Solana.
  *
  * This SDK provides:
- * - Instruction builders for all 17 program instructions
- * - Account decoders for all 4 account types
- * - PDA derivation helpers (7 PDA types)
- * - Error mapping utilities (43 error codes)
+ * - Instruction builders for all 21 program instructions
+ * - Account decoders for all 5 account types
+ * - PDA derivation helpers (8 PDA types)
+ * - Error mapping utilities (44 error codes)
  * - Transaction building helpers
  * - Configurable program ID resolution
  * - Idempotency support for critical operations
@@ -58,6 +58,7 @@ export {
   findLenderPositionPda,
   findBorrowerWhitelistPda,
   findBlacklistCheckPda,
+  findHaircutStatePda,
   deriveMarketPdas,
   BPF_LOADER_UPGRADEABLE_PROGRAM_ID,
 } from './pdas';
@@ -66,6 +67,22 @@ export * from './instructions';
 export * from './accounts';
 export * from './errors';
 export * from './constants';
+export * from './math';
+export { CoalesceClient } from './client';
+export type {
+  ClientOptions,
+  ClientCreateMarketArgs,
+  CreateMarketResult,
+  DepositOverrides,
+  WithdrawOverrides,
+  ClaimHaircutOverrides,
+  BorrowOverrides,
+  RepayOverrides,
+  WithdrawExcessOverrides,
+  CollectFeesOverrides,
+  WhitelistBorrowerArgs,
+  ScanOptions,
+} from './client/types';
 
 // Export Solana Kit compatibility utilities
 export {
