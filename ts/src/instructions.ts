@@ -35,6 +35,8 @@ import {
   type WaterfallRepayArgs,
   type ClaimHaircutAccounts,
   type ForceClaimHaircutAccounts,
+  type WithdrawAndCloseAccounts,
+  type ClaimHaircutAndCloseAccounts,
 } from './types';
 
 /**
@@ -1249,6 +1251,99 @@ export function createWaterfallRepayInstructions(
   }
 
   return instructions;
+}
+
+/**
+ * Create withdraw-and-close instructions: withdraw all remaining balance, then close position.
+ *
+ * Builds two instructions that should be added to a single transaction:
+ * 1. Withdraw (with scaledAmount = 0 to withdraw all remaining balance)
+ * 2. CloseLenderPosition (closes the empty position and returns rent)
+ *
+ * The position must have zero `haircut_owed` for close to succeed. If the lender
+ * has unclaimed haircut recovery, use {@link createClaimHaircutAndCloseInstructions} first.
+ *
+ * @returns Array of 2 TransactionInstruction objects to add to a Transaction.
+ */
+export function createWithdrawAndCloseInstructions(
+  accounts: WithdrawAndCloseAccounts,
+  args: WithdrawArgs,
+  programId?: PublicKey
+): TransactionInstruction[] {
+  const withdrawIx = createWithdrawInstruction(
+    {
+      market: accounts.market,
+      lender: accounts.lender,
+      lenderTokenAccount: accounts.lenderTokenAccount,
+      vault: accounts.vault,
+      lenderPosition: accounts.lenderPosition,
+      marketAuthority: accounts.marketAuthority,
+      blacklistCheck: accounts.blacklistCheck,
+      protocolConfig: accounts.protocolConfig,
+      tokenProgram: accounts.tokenProgram,
+      haircutState: accounts.haircutState,
+    },
+    args,
+    programId
+  );
+
+  const closeIx = createCloseLenderPositionInstruction(
+    {
+      market: accounts.market,
+      lender: accounts.lender,
+      lenderPosition: accounts.lenderPosition,
+      systemProgram: accounts.systemProgram,
+      protocolConfig: accounts.protocolConfig,
+    },
+    programId
+  );
+
+  return [withdrawIx, closeIx];
+}
+
+/**
+ * Create claim-haircut-and-close instructions: claim recovery tokens, then close position.
+ *
+ * Builds two instructions that should be added to a single transaction:
+ * 1. ClaimHaircut (claims haircut recovery tokens, sets haircut_owed to 0)
+ * 2. CloseLenderPosition (closes the empty position and returns rent)
+ *
+ * The position must have zero `scaled_balance` before calling this. If the lender
+ * still has a balance, use {@link createWithdrawAndCloseInstructions} or withdraw first.
+ *
+ * @returns Array of 2 TransactionInstruction objects to add to a Transaction.
+ */
+export function createClaimHaircutAndCloseInstructions(
+  accounts: ClaimHaircutAndCloseAccounts,
+  programId?: PublicKey
+): TransactionInstruction[] {
+  const claimIx = createClaimHaircutInstruction(
+    {
+      market: accounts.market,
+      lender: accounts.lender,
+      lenderPosition: accounts.lenderPosition,
+      lenderTokenAccount: accounts.lenderTokenAccount,
+      vault: accounts.vault,
+      marketAuthority: accounts.marketAuthority,
+      haircutState: accounts.haircutState,
+      protocolConfig: accounts.protocolConfig,
+      tokenProgram: accounts.tokenProgram,
+    },
+    programId
+  );
+
+  const closeIx = createCloseLenderPositionInstruction(
+    {
+      market: accounts.market,
+      lender: accounts.lender,
+      lenderPosition: accounts.lenderPosition,
+      systemProgram: accounts.systemProgram,
+      protocolConfig: accounts.protocolConfig,
+    },
+    programId
+  );
+
+  return [claimIx, closeIx];
 }
 
 /**

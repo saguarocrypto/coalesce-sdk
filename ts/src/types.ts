@@ -502,3 +502,41 @@ export interface WaterfallRepayArgs {
    *  The remainder (totalAmount - interestAmount) goes to principal. */
   interestAmount: TokenAmount;
 }
+
+/**
+ * Accounts for withdraw-and-close (withdraw all remaining balance, then close position).
+ * Combines the accounts needed by both Withdraw and CloseLenderPosition instructions.
+ */
+export interface WithdrawAndCloseAccounts {
+  market: PublicKey;
+  lender: PublicKey;
+  lenderTokenAccount: PublicKey;
+  vault: PublicKey;
+  lenderPosition: PublicKey;
+  marketAuthority: PublicKey;
+  blacklistCheck: PublicKey;
+  protocolConfig: PublicKey;
+  tokenProgram: PublicKey;
+  /** HaircutState PDA for tracking distressed withdrawal haircuts */
+  haircutState: PublicKey;
+  /** System program — required for closing the position account */
+  systemProgram: PublicKey;
+}
+
+/**
+ * Accounts for claim-haircut-and-close (claim recovery tokens, then close position).
+ * Combines the accounts needed by both ClaimHaircut and CloseLenderPosition instructions.
+ */
+export interface ClaimHaircutAndCloseAccounts {
+  market: PublicKey;
+  lender: PublicKey;
+  lenderPosition: PublicKey;
+  lenderTokenAccount: PublicKey;
+  vault: PublicKey;
+  marketAuthority: PublicKey;
+  haircutState: PublicKey;
+  protocolConfig: PublicKey;
+  tokenProgram: PublicKey;
+  /** System program — required for closing the position account */
+  systemProgram: PublicKey;
+}

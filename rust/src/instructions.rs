@@ -902,6 +902,124 @@ pub fn create_waterfall_repay_instructions(
     instructions
 }
 
+/// Accounts for withdraw-and-close (withdraw all remaining balance, then close position).
+/// Combines the accounts needed by both Withdraw and CloseLenderPosition instructions.
+pub struct WithdrawAndCloseAccounts {
+    pub market: Pubkey,
+    pub lender: Pubkey,
+    pub lender_token_account: Pubkey,
+    pub vault: Pubkey,
+    pub lender_position: Pubkey,
+    pub market_authority: Pubkey,
+    pub blacklist_check: Pubkey,
+    pub protocol_config: Pubkey,
+    pub token_program: Pubkey,
+    pub haircut_state: Pubkey,
+    /// System program — required for closing the position account.
+    pub system_program: Pubkey,
+}
+
+/// Create withdraw-and-close instructions: withdraw remaining balance, then close position.
+///
+/// Builds two instructions that should be added to a single transaction:
+/// 1. Withdraw — transfers remaining tokens to lender
+/// 2. CloseLenderPosition — closes the empty position and returns rent
+///
+/// The position must have zero `haircut_owed` for close to succeed. If the lender
+/// has unclaimed haircut recovery, use [`create_claim_haircut_and_close_instructions`] first.
+pub fn create_withdraw_and_close_instructions(
+    accounts: WithdrawAndCloseAccounts,
+    args: WithdrawArgs,
+    program_id: &Pubkey,
+) -> Vec<Instruction> {
+    let withdraw_ix = create_withdraw_instruction(
+        WithdrawAccounts {
+            market: accounts.market,
+            lender: accounts.lender,
+            lender_token_account: accounts.lender_token_account,
+            vault: accounts.vault,
+            lender_position: accounts.lender_position,
+            market_authority: accounts.market_authority,
+            blacklist_check: accounts.blacklist_check,
+            protocol_config: accounts.protocol_config,
+            token_program: accounts.token_program,
+            haircut_state: accounts.haircut_state,
+        },
+        args,
+        program_id,
+    );
+
+    let close_ix = create_close_lender_position_instruction(
+        CloseLenderPositionAccounts {
+            market: accounts.market,
+            lender: accounts.lender,
+            lender_position: accounts.lender_position,
+            system_program: accounts.system_program,
+            protocol_config: accounts.protocol_config,
+        },
+        program_id,
+    );
+
+    vec![withdraw_ix, close_ix]
+}
+
+/// Accounts for claim-haircut-and-close (claim recovery tokens, then close position).
+/// Combines the accounts needed by both ClaimHaircut and CloseLenderPosition instructions.
+pub struct ClaimHaircutAndCloseAccounts {
+    pub market: Pubkey,
+    pub lender: Pubkey,
+    pub lender_position: Pubkey,
+    pub lender_token_account: Pubkey,
+    pub vault: Pubkey,
+    pub market_authority: Pubkey,
+    pub haircut_state: Pubkey,
+    pub protocol_config: Pubkey,
+    pub token_program: Pubkey,
+    /// System program — required for closing the position account.
+    pub system_program: Pubkey,
+}
+
+/// Create claim-haircut-and-close instructions: claim recovery tokens, then close position.
+///
+/// Builds two instructions that should be added to a single transaction:
+/// 1. ClaimHaircut — claims haircut recovery tokens, sets haircut_owed to 0
+/// 2. CloseLenderPosition — closes the empty position and returns rent
+///
+/// The position must have zero `scaled_balance` before calling this. If the lender
+/// still has a balance, use [`create_withdraw_and_close_instructions`] or withdraw first.
+pub fn create_claim_haircut_and_close_instructions(
+    accounts: ClaimHaircutAndCloseAccounts,
+    program_id: &Pubkey,
+) -> Vec<Instruction> {
+    let claim_ix = create_claim_haircut_instruction(
+        ClaimHaircutAccounts {
+            market: accounts.market,
+            lender: accounts.lender,
+            lender_position: accounts.lender_position,
+            lender_token_account: accounts.lender_token_account,
+            vault: accounts.vault,
+            market_authority: accounts.market_authority,
+            haircut_state: accounts.haircut_state,
+            protocol_config: accounts.protocol_config,
+            token_program: accounts.token_program,
+        },
+        program_id,
+    );
+
+    let close_ix = create_close_lender_position_instruction(
+        CloseLenderPositionAccounts {
+            market: accounts.market,
+            lender: accounts.lender,
+            lender_position: accounts.lender_position,
+            system_program: accounts.system_program,
+            protocol_config: accounts.protocol_config,
+        },
+        program_id,
+    );
+
+    vec![claim_ix, close_ix]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1353,3 +1353,148 @@ def create_waterfall_repay_instructions(
         instructions.append(principal_ix)
 
     return instructions
+
+
+class WithdrawAndCloseAccountsDict(TypedDict):
+    """Accounts for withdraw-and-close (withdraw all remaining balance, then close position).
+
+    Combines the accounts needed by both Withdraw and CloseLenderPosition instructions.
+    """
+
+    market: Pubkey
+    lender: Pubkey
+    lender_token_account: Pubkey
+    vault: Pubkey
+    lender_position: Pubkey
+    market_authority: Pubkey
+    blacklist_check: Pubkey
+    protocol_config: Pubkey
+    token_program: Pubkey
+    haircut_state: Pubkey
+    system_program: Pubkey
+    """System program — required for closing the position account."""
+
+
+class ClaimHaircutAndCloseAccountsDict(TypedDict):
+    """Accounts for claim-haircut-and-close (claim recovery tokens, then close position).
+
+    Combines the accounts needed by both ClaimHaircut and CloseLenderPosition instructions.
+    """
+
+    market: Pubkey
+    lender: Pubkey
+    lender_position: Pubkey
+    lender_token_account: Pubkey
+    vault: Pubkey
+    market_authority: Pubkey
+    haircut_state: Pubkey
+    protocol_config: Pubkey
+    token_program: Pubkey
+    system_program: Pubkey
+    """System program — required for closing the position account."""
+
+
+def create_withdraw_and_close_instructions(
+    accounts: WithdrawAndCloseAccountsDict,
+    args: WithdrawArgsDict,
+    program_id: Pubkey | None = None,
+) -> list[Instruction]:
+    """Create withdraw-and-close instructions: withdraw remaining balance, then close position.
+
+    Builds two instructions that should be added to a single transaction:
+
+    1. Withdraw — transfers remaining tokens to lender
+    2. CloseLenderPosition — closes the empty position and returns rent
+
+    The position must have zero ``haircut_owed`` for close to succeed. If the lender
+    has unclaimed haircut recovery, use
+    :func:`create_claim_haircut_and_close_instructions` first.
+
+    Args:
+        accounts: The combined accounts for both instructions.
+        args: Withdraw arguments (scaled_amount, min_amount_out).
+        program_id: Optional program ID override.
+
+    Returns:
+        A list of 2 instructions to add to a transaction.
+    """
+    withdraw_ix = create_withdraw_instruction(
+        accounts={
+            "market": accounts["market"],
+            "lender": accounts["lender"],
+            "lender_token_account": accounts["lender_token_account"],
+            "vault": accounts["vault"],
+            "lender_position": accounts["lender_position"],
+            "market_authority": accounts["market_authority"],
+            "blacklist_check": accounts["blacklist_check"],
+            "protocol_config": accounts["protocol_config"],
+            "token_program": accounts["token_program"],
+            "haircut_state": accounts["haircut_state"],
+        },
+        args=args,
+        program_id=program_id,
+    )
+
+    close_ix = create_close_lender_position_instruction(
+        accounts={
+            "market": accounts["market"],
+            "lender": accounts["lender"],
+            "lender_position": accounts["lender_position"],
+            "system_program": accounts["system_program"],
+            "protocol_config": accounts["protocol_config"],
+        },
+        program_id=program_id,
+    )
+
+    return [withdraw_ix, close_ix]
+
+
+def create_claim_haircut_and_close_instructions(
+    accounts: ClaimHaircutAndCloseAccountsDict,
+    program_id: Pubkey | None = None,
+) -> list[Instruction]:
+    """Create claim-haircut-and-close instructions: claim recovery tokens, then close position.
+
+    Builds two instructions that should be added to a single transaction:
+
+    1. ClaimHaircut — claims haircut recovery tokens, sets haircut_owed to 0
+    2. CloseLenderPosition — closes the empty position and returns rent
+
+    The position must have zero ``scaled_balance`` before calling this. If the lender
+    still has a balance, use :func:`create_withdraw_and_close_instructions` or withdraw
+    first.
+
+    Args:
+        accounts: The combined accounts for both instructions.
+        program_id: Optional program ID override.
+
+    Returns:
+        A list of 2 instructions to add to a transaction.
+    """
+    claim_ix = create_claim_haircut_instruction(
+        accounts={
+            "market": accounts["market"],
+            "lender": accounts["lender"],
+            "lender_token_account": accounts["lender_token_account"],
+            "vault": accounts["vault"],
+            "lender_position": accounts["lender_position"],
+            "market_authority": accounts["market_authority"],
+            "haircut_state": accounts["haircut_state"],
+            "protocol_config": accounts["protocol_config"],
+            "token_program": accounts["token_program"],
+        },
+        program_id=program_id,
+    )
+
+    close_ix = create_close_lender_position_instruction(
+        accounts={
+            "market": accounts["market"],
+            "lender": accounts["lender"],
+            "lender_position": accounts["lender_position"],
+            "system_program": accounts["system_program"],
+            "protocol_config": accounts["protocol_config"],
+        },
+        program_id=program_id,
+    )
+
+    return [claim_ix, close_ix]
