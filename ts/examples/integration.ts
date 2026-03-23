@@ -38,6 +38,11 @@
  *   reSettle               — Improve settlement factor (permissionless)
  *   collectFees            — Collect protocol fees (fee authority)
  *
+ * MARKET DISCOVERY
+ *   getMarketAddress       — Derive a market PDA from borrower + nonce
+ *   findBorrowerMarkets    — Find all markets created by a borrower
+ *   findLenderMarkets      — Find all markets a lender has positions in
+ *
  * READING STATE
  *   getMarket              — Fetch and decode a market
  *   getLenderPosition       — Fetch and decode a lender position
@@ -90,6 +95,7 @@ import {
   findMarketAuthorityPda,
   findBorrowerWhitelistPda,
   findBlacklistCheckPda,
+  findMarketPda,
   findHaircutStatePda,
   deriveMarketPdas,
   // Account fetching
@@ -625,6 +631,83 @@ export async function collectFees(
   });
 
   return send(connection, [ix], [feeAuthority]);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// MARKET DISCOVERY
+// ═════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Derive a market PDA from a borrower address and nonce.
+ *
+ * Use this when you already know the borrower and market nonce (e.g., from
+ * your own database or the CoalesceFi indexer).
+ *
+ * The first market a borrower creates uses nonce 0, the second uses nonce 1, etc.
+ */
+export function getMarketAddress(
+  borrower: PublicKey,
+  marketNonce: bigint = 0n
+): PublicKey {
+  const [marketPda] = findMarketPda(borrower, marketNonce);
+  return marketPda;
+}
+
+/**
+ * Find all markets created by a borrower.
+ *
+ * Iterates nonces 0..maxNonce, checks which market PDAs exist on-chain,
+ * and returns them with decoded market data.
+ *
+ * @param maxNonce - Maximum nonce to check (default 10). Increase if the
+ *                   borrower may have created more markets.
+ */
+export async function findBorrowerMarkets(
+  connection: Connection,
+  borrower: PublicKey,
+  maxNonce: number = 10
+): Promise<Array<{ marketPda: PublicKey; nonce: bigint; market: NonNullable<Awaited<ReturnType<typeof fetchMarket>>> }>> {
+  const results = [];
+
+  for (let i = 0; i < maxNonce; i++) {
+    const nonce = BigInt(i);
+    const [marketPda] = findMarketPda(borrower, nonce);
+    const market = await fetchMarket(connection, marketPda);
+    if (market) {
+      results.push({ marketPda, nonce, market });
+    }
+  }
+
+  return results;
+}
+
+/**
+ * Find all markets a lender has positions in.
+ *
+ * Checks whether lender position PDAs exist for each of the borrower's markets.
+ * Requires knowing the borrower address — use your indexer or API to get the
+ * list of active borrowers if needed.
+ */
+export async function findLenderMarkets(
+  connection: Connection,
+  lender: PublicKey,
+  borrowers: PublicKey[],
+  maxNoncePerBorrower: number = 10
+): Promise<Array<{ marketPda: PublicKey; position: NonNullable<Awaited<ReturnType<typeof fetchLenderPosition>>> }>> {
+  const results = [];
+
+  for (const borrower of borrowers) {
+    for (let i = 0; i < maxNoncePerBorrower; i++) {
+      const [marketPda] = findMarketPda(borrower, BigInt(i));
+      const [lenderPositionPda] = findLenderPositionPda(marketPda, lender);
+      const position = await fetchLenderPosition(connection, lenderPositionPda);
+      if (position) {
+        results.push({ marketPda, position });
+      }
+    }
+  }
+
+  return results;
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
