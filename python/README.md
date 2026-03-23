@@ -439,6 +439,7 @@ except Exception as err:
 | Lender Position    | `["lender", market, lender]`       | `find_lender_position_pda(market, lender, program_id?)` |
 | Borrower Whitelist | `["borrower_whitelist", borrower]` | `find_borrower_whitelist_pda(borrower, program_id?)`    |
 | Blacklist Check    | `["blacklist", address]`           | `find_blacklist_check_pda(address, blacklist_program)`  |
+| Haircut State      | `["haircut_state", market]`        | `find_haircut_state_pda(market, program_id=None)`       |
 
 All PDA functions return `tuple[Pubkey, int]`. Use `derive_market_pdas(borrower, market_nonce, program_id?)` to derive market, authority, and vault PDAs in one call, returning a `MarketPdas` dataclass.
 
@@ -476,11 +477,24 @@ All PDA functions return `tuple[Pubkey, int]`. Use `derive_market_pdas(borrower,
 | CloseLenderPosition | `create_close_lender_position_instruction` | —                                                                                   |
 | WithdrawExcess      | `create_withdraw_excess_instruction`       | —                                                                                   |
 
-### Helpers
+### Post-Maturity / Haircut Recovery
 
-| Helper          | Function                              | Description                              |
-| --------------- | ------------------------------------- | ---------------------------------------- |
-| Waterfall Repay | `create_waterfall_repay_instructions` | Interest-first, then principal repayment |
+| Instruction        | Builder                                     | Args | Description                                               |
+| ------------------ | ------------------------------------------- | ---- | --------------------------------------------------------- |
+| ForceClosePosition | `create_force_close_position_instruction`   | —    | Borrower force-closes a lender's position (post-maturity) |
+| ClaimHaircut       | `create_claim_haircut_instruction`          | —    | Lender claims haircut recovery tokens                     |
+| ForceClaimHaircut  | `create_force_claim_haircut_instruction`    | —    | Borrower force-claims haircut on behalf of a lender       |
+
+### Combined Instruction Builders
+
+These helpers return `list[Instruction]` to add to a single transaction,
+reducing the number of transactions a user needs to send.
+
+| Helper                | Function                                       | Description                                                |
+| --------------------- | ---------------------------------------------- | ---------------------------------------------------------- |
+| Waterfall Repay       | `create_waterfall_repay_instructions`          | Interest-first, then principal repayment (0–2 ixs)        |
+| Withdraw + Close      | `create_withdraw_and_close_instructions`       | Withdraw all + close position in one tx (2 ixs)           |
+| Claim Haircut + Close | `create_claim_haircut_and_close_instructions`  | Claim haircut recovery + close position in one tx (2 ixs) |
 
 ---
 

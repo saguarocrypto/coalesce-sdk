@@ -272,11 +272,14 @@ let tx = Transaction::new_signed_with_payer(
 client.send_and_confirm_transaction(&tx).unwrap();
 
 // 4. Market matures + settlement grace period elapses → anyone calls ReSettle
+let haircut_state = find_haircut_state_pda(&pdas.market.address, &program_id);
+
 let resettle_ix = create_resettle_instruction(
     ReSettleAccounts {
         market: pdas.market.address,
         vault: pdas.vault.address,
         protocol_config: protocol_config.address,
+        haircut_state: haircut_state.address,
     },
     &program_id,
 );
@@ -305,9 +308,9 @@ let tx = Transaction::new_signed_with_payer(
 );
 client.send_and_confirm_transaction(&tx).unwrap();
 
-// 6. Lender withdraws with slippage protection
-let withdraw_ix = create_withdraw_instruction(
-    WithdrawAccounts {
+// 6. Lender withdraws all + closes position in a single transaction
+let withdraw_and_close_ixs = create_withdraw_and_close_instructions(
+    WithdrawAndCloseAccounts {
         market: pdas.market.address,
         lender: lender.pubkey(),
         lender_token_account,
@@ -317,6 +320,8 @@ let withdraw_ix = create_withdraw_instruction(
         blacklist_check: lender_blacklist.address,
         protocol_config: protocol_config.address,
         token_program: spl_token::id(),
+        haircut_state: haircut_state.address,
+        system_program: system_program::id(),
     },
     WithdrawArgs {
         scaled_amount: 0,              // 0 = full withdrawal
@@ -326,26 +331,12 @@ let withdraw_ix = create_withdraw_instruction(
 );
 
 let blockhash = client.get_latest_blockhash().unwrap();
-let tx = Transaction::new_signed_with_payer(&[withdraw_ix], Some(&lender.pubkey()), &[&lender], blockhash);
-client.send_and_confirm_transaction(&tx).unwrap();
-
-// 7. Lender closes empty position (reclaims rent)
-let close_ix = create_close_lender_position_instruction(
-    CloseLenderPositionAccounts {
-        market: pdas.market.address,
-        lender: lender.pubkey(),
-        lender_position: lender_position.address,
-        system_program: system_program::id(),
-        protocol_config: protocol_config.address,
-    },
-    &program_id,
+let tx = Transaction::new_signed_with_payer(
+    &withdraw_and_close_ixs, Some(&lender.pubkey()), &[&lender], blockhash,
 );
-
-let blockhash = client.get_latest_blockhash().unwrap();
-let tx = Transaction::new_signed_with_payer(&[close_ix], Some(&lender.pubkey()), &[&lender], blockhash);
 client.send_and_confirm_transaction(&tx).unwrap();
 
-// 8. Borrower withdraws excess funds from vault
+// 7. Borrower withdraws excess funds from vault
 let withdraw_excess_ix = create_withdraw_excess_instruction(
     WithdrawExcessAccounts {
         market: pdas.market.address,
@@ -443,8 +434,9 @@ match client.send_and_confirm_transaction(&tx) {
 | Lender Position    | `["lender", market, lender]`       | `find_lender_position_pda(market, lender, program_id)` |
 | Borrower Whitelist | `["borrower_whitelist", borrower]` | `find_borrower_whitelist_pda(borrower, program_id)`    |
 | Blacklist Check    | `["blacklist", address]`           | `find_blacklist_check_pda(address, blacklist_program)` |
+| Haircut State      | `["haircut_state", market]`        | `find_haircut_state_pda(market, program_id)`           |
 
-All PDA functions return `PdaResult { address: Pubkey, bump: u8 }`. Use `derive_market_pdas(borrower, market_nonce, program_id)` to derive market, authority, and vault PDAs in one call, returning `MarketPdas`.
+All PDA functions return `PdaResult { address: Pubkey, bump: u8 }`. Use `derive_market_pdas(borrower, market_nonce, program_id)` to derive market, authority, vault, and haircut state PDAs in one call, returning `MarketPdas`.
 
 ## Instruction Reference
 
@@ -480,11 +472,24 @@ All PDA functions return `PdaResult { address: Pubkey, bump: u8 }`. Use `derive_
 | CloseLenderPosition | `create_close_lender_position_instruction` | —                                                                                              |
 | WithdrawExcess      | `create_withdraw_excess_instruction`       | —                                                                                              |
 
-### Helpers
+### Post-Maturity / Haircut Recovery
 
-| Helper          | Function                              | Description                              |
-| --------------- | ------------------------------------- | ---------------------------------------- |
-| Waterfall Repay | `create_waterfall_repay_instructions` | Interest-first, then principal repayment |
+| Instruction        | Builder                                     | Args | Description                                               |
+| ------------------ | ------------------------------------------- | ---- | --------------------------------------------------------- |
+| ForceClosePosition | `create_force_close_position_instruction`   | —    | Borrower force-closes a lender's position (post-maturity) |
+| ClaimHaircut       | `create_claim_haircut_instruction`          | —    | Lender claims haircut recovery tokens                     |
+| ForceClaimHaircut  | `create_force_claim_haircut_instruction`    | —    | Borrower force-claims haircut on behalf of a lender       |
+
+### Combined Instruction Builders
+
+These helpers return `Vec<Instruction>` to add to a single transaction,
+reducing the number of transactions a user needs to send.
+
+| Helper                | Function                                       | Description                                                |
+| --------------------- | ---------------------------------------------- | ---------------------------------------------------------- |
+| Waterfall Repay       | `create_waterfall_repay_instructions`          | Interest-first, then principal repayment (0–2 ixs)        |
+| Withdraw + Close      | `create_withdraw_and_close_instructions`       | Withdraw all + close position in one tx (2 ixs)           |
+| Claim Haircut + Close | `create_claim_haircut_and_close_instructions`  | Claim haircut recovery + close position in one tx (2 ixs) |
 
 ---
 

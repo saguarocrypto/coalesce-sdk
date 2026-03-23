@@ -161,10 +161,11 @@ import {
   createWaterfallRepayInstructions,
   createReSettleInstruction,
   createCollectFeesInstruction,
-  createWithdrawInstruction,
-  createCloseLenderPositionInstruction,
+  createWithdrawAndCloseInstructions,
   createWithdrawExcessInstruction,
+  findHaircutStatePda,
   fetchMarket,
+  SYSTEM_PROGRAM_ID,
 } from '@coalescefi/sdk';
 
 configureSdk({ network: 'mainnet' });
@@ -248,10 +249,13 @@ const repayIxs = createWaterfallRepayInstructions(
 await sendAndConfirmTransaction(connection, new Transaction().add(...repayIxs), [borrower]);
 
 // 4. Market matures + settlement grace period elapses → anyone calls ReSettle
+const [haircutState] = findHaircutStatePda(market.address);
+
 const resettleIx = createReSettleInstruction({
   market: market.address,
   vault: vault.address,
   protocolConfig,
+  haircutState,
 });
 
 await sendAndConfirmTransaction(connection, new Transaction().add(resettleIx), [lender]);
@@ -269,8 +273,8 @@ const collectFeesIx = createCollectFeesInstruction({
 
 await sendAndConfirmTransaction(connection, new Transaction().add(collectFeesIx), [feeAuthority]);
 
-// 6. Lender withdraws with slippage protection
-const withdrawIx = createWithdrawInstruction(
+// 6. Lender withdraws all + closes position in a single transaction
+const withdrawAndCloseIxs = createWithdrawAndCloseInstructions(
   {
     market: market.address,
     lender: lender.publicKey,
@@ -281,6 +285,8 @@ const withdrawIx = createWithdrawInstruction(
     blacklistCheck: lenderBlacklistCheck,
     protocolConfig,
     tokenProgram: TOKEN_PROGRAM_ID,
+    haircutState,
+    systemProgram: SYSTEM_PROGRAM_ID,
   },
   {
     scaledAmount: 0n, // 0 = full withdrawal
@@ -288,20 +294,13 @@ const withdrawIx = createWithdrawInstruction(
   }
 );
 
-await sendAndConfirmTransaction(connection, new Transaction().add(withdrawIx), [lender]);
+await sendAndConfirmTransaction(
+  connection,
+  new Transaction().add(...withdrawAndCloseIxs),
+  [lender]
+);
 
-// 7. Lender closes empty position (reclaims rent)
-const closeIx = createCloseLenderPositionInstruction({
-  market: market.address,
-  lender: lender.publicKey,
-  lenderPosition,
-  systemProgram: SystemProgram.programId,
-  protocolConfig,
-});
-
-await sendAndConfirmTransaction(connection, new Transaction().add(closeIx), [lender]);
-
-// 8. Borrower withdraws excess funds from vault
+// 7. Borrower withdraws excess funds from vault
 const withdrawExcessIx = createWithdrawExcessInstruction({
   market: market.address,
   borrower: borrower.publicKey,
@@ -414,8 +413,9 @@ try {
 | Lender Position    | `["lender", market, lender]`       | `findLenderPositionPda(market, lender, programId?)` |
 | Borrower Whitelist | `["borrower_whitelist", borrower]` | `findBorrowerWhitelistPda(borrower, programId?)`    |
 | Blacklist Check    | `["blacklist", address]`           | `findBlacklistCheckPda(address, blacklistProgram)`  |
+| Haircut State      | `["haircut_state", market]`        | `findHaircutStatePda(market, programId?)`           |
 
-All PDA functions return `[PublicKey, number]`. Use `deriveMarketPdas(borrower, marketNonce, programId?)` to derive market, authority, and vault PDAs in one call.
+All PDA functions return `[PublicKey, number]`. Use `deriveMarketPdas(borrower, marketNonce, programId?)` to derive market, authority, vault, and haircut state PDAs in one call.
 
 ## Instruction Reference
 
@@ -448,14 +448,27 @@ All PDA functions return `[PublicKey, number]`. Use `deriveMarketPdas(borrower, 
 | Withdraw            | `createWithdrawInstruction`            | `{ scaledAmount, minPayout? }`                                          |
 | ReSettle            | `createReSettleInstruction`            | — (permissionless)                                                      |
 | CollectFees         | `createCollectFeesInstruction`         | —                                                                       |
-| CloseLenderPosition | `createCloseLenderPositionInstruction` | —                                                                       |
-| WithdrawExcess      | `createWithdrawExcessInstruction`      | —                                                                       |
+| CloseLenderPosition | `createCloseLenderPositionInstruction`  | —                                                                       |
+| WithdrawExcess      | `createWithdrawExcessInstruction`       | —                                                                       |
 
-### Helpers
+### Post-Maturity / Haircut Recovery
 
-| Helper          | Function                           | Description                              |
-| --------------- | ---------------------------------- | ---------------------------------------- |
-| Waterfall Repay | `createWaterfallRepayInstructions` | Interest-first, then principal repayment |
+| Instruction       | Builder                                  | Args | Description                                          |
+| ----------------- | ---------------------------------------- | ---- | ---------------------------------------------------- |
+| ForceClosePosition | `createForceClosePositionInstruction`   | —    | Borrower force-closes a lender's position (post-maturity) |
+| ClaimHaircut       | `createClaimHaircutInstruction`         | —    | Lender claims haircut recovery tokens                |
+| ForceClaimHaircut  | `createForceClaimHaircutInstruction`    | —    | Borrower force-claims haircut on behalf of a lender  |
+
+### Combined Instruction Builders
+
+These helpers return arrays of instructions to add to a single transaction,
+reducing the number of transactions a user needs to send.
+
+| Helper                   | Function                                    | Description                                              |
+| ------------------------ | ------------------------------------------- | -------------------------------------------------------- |
+| Waterfall Repay          | `createWaterfallRepayInstructions`          | Interest-first, then principal repayment (0–2 ixs)      |
+| Withdraw + Close         | `createWithdrawAndCloseInstructions`        | Withdraw all + close position in one tx (2 ixs)         |
+| Claim Haircut + Close    | `createClaimHaircutAndCloseInstructions`    | Claim haircut recovery + close position in one tx (2 ixs) |
 
 ---
 
