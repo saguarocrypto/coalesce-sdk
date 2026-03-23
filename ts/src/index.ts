@@ -68,6 +68,21 @@ export * from './accounts';
 export * from './errors';
 export * from './constants';
 export * from './math';
+export { CoalesceClient } from './client';
+export type {
+  ClientOptions,
+  ClientCreateMarketArgs,
+  CreateMarketResult,
+  DepositOverrides,
+  WithdrawOverrides,
+  ClaimHaircutOverrides,
+  BorrowOverrides,
+  RepayOverrides,
+  WithdrawExcessOverrides,
+  CollectFeesOverrides,
+  WhitelistBorrowerArgs,
+  ScanOptions,
+} from './client/types';
 
 // Export Solana Kit compatibility utilities
 export {

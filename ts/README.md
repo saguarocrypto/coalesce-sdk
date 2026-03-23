@@ -8,7 +8,55 @@ TypeScript SDK for the [CoalesceFi](https://www.coalescefi.com/en/docs) on-chain
 pnpm add @coalescefi/sdk
 ```
 
-## Configuration
+## Quick Start — CoalesceClient
+
+The high-level `CoalesceClient` handles PDA derivation, account resolution, and caching automatically. Every method returns `TransactionInstruction[]` — you control how to sign and send.
+
+```ts
+import { CoalesceClient } from '@coalescefi/sdk';
+import { Connection, Keypair, Transaction, sendAndConfirmTransaction } from '@solana/web3.js';
+
+const connection = new Connection('https://api.mainnet-beta.solana.com');
+const client = CoalesceClient.mainnet(connection);
+
+// Lender deposits (position auto-created on first deposit)
+const depositIxs = await client.deposit(lender.publicKey, marketPda, 100_000_000_000n);
+await sendAndConfirmTransaction(connection, new Transaction().add(...depositIxs), [lender]);
+
+// Borrower repays interest + principal in one transaction
+const repayIxs = await client.repay(borrower.publicKey, marketPda, 52_000_000_000n, 2_000_000_000n);
+await sendAndConfirmTransaction(connection, new Transaction().add(...repayIxs), [borrower]);
+
+// Lender withdraws all + closes position in one transaction
+const exitIxs = await client.withdrawAndClose(lender.publicKey, marketPda);
+await sendAndConfirmTransaction(connection, new Transaction().add(...exitIxs), [lender]);
+
+// Or use the convenience helper for scripts/tests:
+const sig = await client.sendAndConfirm(
+  await client.deposit(lender.publicKey, marketPda, 50_000_000_000n),
+  [lender]
+);
+
+// Market discovery (helper — use indexer/API for production)
+const markets = await client.scanMarkets(borrowerPubkey);
+const marketPda = client.getMarketAddress(borrowerPubkey, 0n);
+```
+
+Override token accounts for multisig, custody, or non-ATA setups:
+
+```ts
+const ixs = await client.deposit(vaultPda, marketPda, amount, {
+  lenderTokenAccount: squadsVaultAta,  // override default ATA derivation
+});
+```
+
+See `ts/examples/integration.ts` for the complete copy-paste reference with every operation.
+
+---
+
+## Advanced: Low-Level Configuration
+
+For direct instruction building without `CoalesceClient`:
 
 ```ts
 import { configureSdk, getProgramId } from '@coalescefi/sdk';
