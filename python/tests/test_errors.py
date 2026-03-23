@@ -22,7 +22,7 @@ from coalescefi_sdk import (
 
 
 class TestErrorCodes:
-    """Test that all 43 error codes are defined."""
+    """Test that all 44 error codes are defined."""
 
     def test_initialization_errors(self):
         """Test initialization error codes (0-4)."""
@@ -91,9 +91,9 @@ class TestErrorCodes:
         assert CoalescefiErrorCode.MathOverflow == 41
         assert CoalescefiErrorCode.PayoutBelowMinimum == 42
 
-    def test_all_43_error_codes_exist(self):
-        """Verify all 43 error codes are defined."""
-        assert len(CoalescefiErrorCode) == 43
+    def test_all_44_error_codes_exist(self):
+        """Verify all 44 error codes are defined (including NoHaircutToClaim)."""
+        assert len(CoalescefiErrorCode) == 44
 
 
 class TestErrorMessages:

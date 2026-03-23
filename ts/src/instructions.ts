@@ -30,8 +30,11 @@ import {
   type SetAdminAccounts,
   type SetWhitelistManagerAccounts,
   type WithdrawExcessAccounts,
+  type ForceClosePositionAccounts,
   type WaterfallRepayAccounts,
   type WaterfallRepayArgs,
+  type ClaimHaircutAccounts,
+  type ForceClaimHaircutAccounts,
 } from './types';
 
 /**
@@ -453,7 +456,7 @@ function writeU128LE(buffer: Buffer, value: bigint, offset: number): void {
  * Discriminator: 0
  *
  * On-chain account order: [protocol_config, admin, fee_authority, whitelist_manager, blacklist_program, system_program, program_data]
- * Data layout: [fee_rate_bps(2 bytes)]
+ * Data layout: [disc(1 byte), fee_rate_bps(2 bytes)]
  *
  * Note: Only the program's upgrade authority can initialize the protocol.
  * The program_data account is derived from the program ID via BPF Loader Upgradeable.
@@ -529,7 +532,7 @@ export function createSetFeeConfigInstruction(
  * Create CreateMarket instruction.
  * Discriminator: 2
  *
- * On-chain account order: [market, borrower, mint, vault, market_authority, protocol_config, borrower_whitelist, blacklist_check, system_program, token_program]
+ * On-chain account order: [market, borrower, mint, vault, market_authority, protocol_config, borrower_whitelist, blacklist_check, system_program, token_program, haircut_state]
  * Data layout: [market_nonce(8), annual_interest_bps(2), maturity_timestamp(8), max_total_supply(8)]
  */
 export function createCreateMarketInstruction(
@@ -577,6 +580,7 @@ export function createCreateMarketInstruction(
       { pubkey: accounts.blacklistCheck, isSigner: false, isWritable: false },
       { pubkey: accounts.systemProgram, isSigner: false, isWritable: false },
       { pubkey: accounts.tokenProgram, isSigner: false, isWritable: false },
+      { pubkey: accounts.haircutState, isSigner: false, isWritable: true },
     ],
     data,
   });
@@ -709,7 +713,7 @@ export function createRepayInstruction(
  * Create Withdraw instruction.
  * Discriminator: 7
  *
- * On-chain account order: [market, lender, lender_token, vault, lender_position, market_authority, blacklist_check, protocol_config, token_program]
+ * On-chain account order: [market, lender, lender_token, vault, lender_position, market_authority, blacklist_check, protocol_config, token_program, haircut_state]
  * Data layout: [scaled_amount(16 bytes, u128), min_payout(8 bytes, u64)]
  *
  * SECURITY NOTE: The min_payout parameter provides slippage protection.
@@ -751,6 +755,7 @@ export function createWithdrawInstruction(
       { pubkey: accounts.blacklistCheck, isSigner: false, isWritable: false },
       { pubkey: accounts.protocolConfig, isSigner: false, isWritable: false },
       { pubkey: accounts.tokenProgram, isSigner: false, isWritable: false },
+      { pubkey: accounts.haircutState, isSigner: false, isWritable: true },
     ],
     data,
   });
@@ -818,7 +823,7 @@ export function createCloseLenderPositionInstruction(
  * Create ReSettle instruction.
  * Discriminator: 9
  *
- * On-chain account order: [market, vault, protocol_config]
+ * On-chain account order: [market, vault, protocol_config, haircut_state]
  * Data layout: [discriminator only] — permissionless, no args
  *
  * SECURITY NOTE: ReSettle now requires protocol_config to ensure proper
@@ -841,7 +846,8 @@ export function createReSettleInstruction(
     keys: [
       { pubkey: accounts.market, isSigner: false, isWritable: true },
       { pubkey: accounts.vault, isSigner: false, isWritable: false },
-      { pubkey: accounts.protocolConfig, isSigner: false, isWritable: false }, // New: required for fee accrual
+      { pubkey: accounts.protocolConfig, isSigner: false, isWritable: false },
+      { pubkey: accounts.haircutState, isSigner: false, isWritable: false },
     ],
     data,
   });
@@ -1040,7 +1046,7 @@ export function createRepayInterestInstruction(
  * Allows the borrower to withdraw excess funds from the vault.
  * Only the market's borrower can call this instruction.
  *
- * On-chain account order: [market, borrower, borrower_token, vault, market_authority, token_program, protocol_config]
+ * On-chain account order: [market, borrower, borrower_token, vault, market_authority, token_program, protocol_config, blacklist_check, borrower_whitelist]
  * Data layout: [discriminator only]
  */
 export function createWithdrawExcessInstruction(
@@ -1061,6 +1067,114 @@ export function createWithdrawExcessInstruction(
       { pubkey: accounts.marketAuthority, isSigner: false, isWritable: false },
       { pubkey: accounts.tokenProgram, isSigner: false, isWritable: false },
       { pubkey: accounts.protocolConfig, isSigner: false, isWritable: false },
+      { pubkey: accounts.blacklistCheck, isSigner: false, isWritable: false },
+      { pubkey: accounts.borrowerWhitelist, isSigner: false, isWritable: false },
+    ],
+    data,
+  });
+}
+
+/**
+ * Create ForceClosePosition instruction.
+ * Discriminator: 18
+ *
+ * Force-close an abandoned lender position after maturity plus the settlement grace period.
+ * Only the market's borrower can call this instruction.
+ *
+ * On-chain account order: [market, borrower, lender_position, vault, escrow_token_account, market_authority, protocol_config, token_program, haircut_state]
+ * Data layout: [discriminator only]
+ */
+export function createForceClosePositionInstruction(
+  accounts: ForceClosePositionAccounts,
+  programId?: PublicKey
+): TransactionInstruction {
+  const data = Buffer.alloc(1);
+  data.writeUInt8(InstructionDiscriminator.ForceClosePosition, 0);
+
+  const resolvedProgramId = programId ?? getProgramId();
+  return new TransactionInstruction({
+    programId: resolvedProgramId,
+    keys: [
+      { pubkey: accounts.market, isSigner: false, isWritable: true },
+      { pubkey: accounts.borrower, isSigner: true, isWritable: false },
+      { pubkey: accounts.lenderPosition, isSigner: false, isWritable: true },
+      { pubkey: accounts.vault, isSigner: false, isWritable: true },
+      { pubkey: accounts.escrowTokenAccount, isSigner: false, isWritable: true },
+      { pubkey: accounts.marketAuthority, isSigner: false, isWritable: false },
+      { pubkey: accounts.protocolConfig, isSigner: false, isWritable: false },
+      { pubkey: accounts.tokenProgram, isSigner: false, isWritable: false },
+      { pubkey: accounts.haircutState, isSigner: false, isWritable: true },
+    ],
+    data,
+  });
+}
+
+/**
+ * Create ClaimHaircut instruction.
+ * Discriminator: 19
+ *
+ * Lender claims proportional recovery of their haircut when the settlement
+ * factor has improved since their distressed withdrawal.
+ *
+ * On-chain account order: [market, lender, lender_position, lender_token, vault, market_authority, haircut_state, protocol_config, token_program]
+ * Data layout: [discriminator only]
+ */
+export function createClaimHaircutInstruction(
+  accounts: ClaimHaircutAccounts,
+  programId?: PublicKey
+): TransactionInstruction {
+  const data = Buffer.alloc(1);
+  data.writeUInt8(InstructionDiscriminator.ClaimHaircut, 0);
+
+  const resolvedProgramId = programId ?? getProgramId();
+  return new TransactionInstruction({
+    programId: resolvedProgramId,
+    keys: [
+      { pubkey: accounts.market, isSigner: false, isWritable: true },
+      { pubkey: accounts.lender, isSigner: true, isWritable: false },
+      { pubkey: accounts.lenderPosition, isSigner: false, isWritable: true },
+      { pubkey: accounts.lenderTokenAccount, isSigner: false, isWritable: true },
+      { pubkey: accounts.vault, isSigner: false, isWritable: true },
+      { pubkey: accounts.marketAuthority, isSigner: false, isWritable: false },
+      { pubkey: accounts.haircutState, isSigner: false, isWritable: true },
+      { pubkey: accounts.protocolConfig, isSigner: false, isWritable: false },
+      { pubkey: accounts.tokenProgram, isSigner: false, isWritable: false },
+    ],
+    data,
+  });
+}
+
+/**
+ * Create ForceClaimHaircut instruction.
+ * Discriminator: 20
+ *
+ * Borrower force-claims a haircut on behalf of an abandoned or blacklisted lender.
+ * Mirrors force_close_position: borrower signs, funds go to the lender's escrow
+ * token account.
+ *
+ * On-chain account order: [market, borrower, lender_position, escrow_token, vault, market_authority, haircut_state, protocol_config, token_program]
+ * Data layout: [discriminator only]
+ */
+export function createForceClaimHaircutInstruction(
+  accounts: ForceClaimHaircutAccounts,
+  programId?: PublicKey
+): TransactionInstruction {
+  const data = Buffer.alloc(1);
+  data.writeUInt8(InstructionDiscriminator.ForceClaimHaircut, 0);
+
+  const resolvedProgramId = programId ?? getProgramId();
+  return new TransactionInstruction({
+    programId: resolvedProgramId,
+    keys: [
+      { pubkey: accounts.market, isSigner: false, isWritable: true },
+      { pubkey: accounts.borrower, isSigner: true, isWritable: false },
+      { pubkey: accounts.lenderPosition, isSigner: false, isWritable: true },
+      { pubkey: accounts.escrowTokenAccount, isSigner: false, isWritable: true },
+      { pubkey: accounts.vault, isSigner: false, isWritable: true },
+      { pubkey: accounts.marketAuthority, isSigner: false, isWritable: false },
+      { pubkey: accounts.haircutState, isSigner: false, isWritable: true },
+      { pubkey: accounts.protocolConfig, isSigner: false, isWritable: false },
+      { pubkey: accounts.tokenProgram, isSigner: false, isWritable: false },
     ],
     data,
   });
