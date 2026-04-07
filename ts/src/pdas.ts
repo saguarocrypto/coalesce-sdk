@@ -22,7 +22,10 @@ export const BPF_LOADER_UPGRADEABLE_PROGRAM_ID = new PublicKey(
  */
 function u64ToLEBytes(value: bigint): Buffer {
   const buffer = Buffer.alloc(8);
-  buffer.writeBigUInt64LE(value);
+  // Use DataView so this works in browser bundlers whose Buffer polyfill
+  // may not implement writeBigUInt64LE.
+  const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+  view.setBigUint64(0, value, true);
   return buffer;
 }
 

@@ -1,4 +1,4 @@
-import { type PublicKey, TransactionInstruction } from '@solana/web3.js';
+import { PublicKey, TransactionInstruction } from '@solana/web3.js';
 
 import { getProgramId, InstructionDiscriminator } from './constants';
 import {
@@ -93,38 +93,11 @@ export function generateIdempotencyKey(): string {
     ].join('-');
   }
 
-  // Priority 3: Node.js crypto module (for older Node.js versions)
-  try {
-    // Dynamic require to avoid bundler issues in browser environments
-    // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
-    const nodeCrypto = require('crypto') as {
-      randomUUID?: () => string;
-      randomBytes?: (size: number) => Buffer;
-    };
-    if (nodeCrypto !== null && typeof nodeCrypto.randomUUID === 'function') {
-      return nodeCrypto.randomUUID();
-    }
-    if (nodeCrypto !== null && typeof nodeCrypto.randomBytes === 'function') {
-      const bytes = nodeCrypto.randomBytes(16);
-      bytes[6] = (bytes[6]! & 0x0f) | 0x40;
-      bytes[8] = (bytes[8]! & 0x3f) | 0x80;
-      return [
-        bytes.toString('hex', 0, 4),
-        bytes.toString('hex', 4, 6),
-        bytes.toString('hex', 6, 8),
-        bytes.toString('hex', 8, 10),
-        bytes.toString('hex', 10, 16),
-      ].join('-');
-    }
-  } catch {
-    // Node crypto not available
-  }
-
   // No secure random source available - throw instead of using insecure fallback
   throw new Error(
     'No cryptographically secure random source available. ' +
-      'Idempotency keys require crypto.randomUUID(), crypto.getRandomValues(), ' +
-      "or Node.js crypto module. If you're in a test environment, " +
+      'Idempotency keys require crypto.randomUUID() or crypto.getRandomValues(). ' +
+      "If you're in a test environment, " +
       'consider using createDeterministicIdempotencyKey() instead.'
   );
 }
@@ -165,12 +138,8 @@ export function createMemoInstruction(
   memo: string,
   signerPubkeys: PublicKey[] = []
 ): TransactionInstruction {
-  // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
-  const { PublicKey: PubKey } = require('@solana/web3.js') as {
-    PublicKey: typeof PublicKey;
-  };
   return new TransactionInstruction({
-    programId: new PubKey(MEMO_PROGRAM_ID),
+    programId: new PublicKey(MEMO_PROGRAM_ID),
     keys: signerPubkeys.map((pubkey) => ({
       pubkey,
       isSigner: true,
@@ -221,16 +190,22 @@ function writeU16LE(buffer: Buffer, value: number, offset: number): void {
 
 /**
  * Helper to write a u64 to a buffer (little-endian).
+ *
+ * Uses a DataView instead of Buffer.writeBigUInt64LE so the SDK works in
+ * browser bundlers (turbopack, webpack) whose Buffer polyfill may not
+ * implement the BigInt64 methods.
  */
 function writeU64LE(buffer: Buffer, value: bigint, offset: number): void {
-  buffer.writeBigUInt64LE(value, offset);
+  const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+  view.setBigUint64(offset, value, true);
 }
 
 /**
  * Helper to write an i64 to a buffer (little-endian).
  */
 function writeI64LE(buffer: Buffer, value: bigint, offset: number): void {
-  buffer.writeBigInt64LE(value, offset);
+  const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+  view.setBigInt64(offset, value, true);
 }
 
 /** Maximum u64 value */
@@ -447,8 +422,9 @@ function writeU128LE(buffer: Buffer, value: bigint, offset: number): void {
   validateU128(value, 'u128 value');
   const low = value & BigInt('0xFFFFFFFFFFFFFFFF');
   const high = value >> BigInt(64);
-  buffer.writeBigUInt64LE(low, offset);
-  buffer.writeBigUInt64LE(high, offset + 8);
+  const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+  view.setBigUint64(offset, low, true);
+  view.setBigUint64(offset + 8, high, true);
 }
 
 /**
