@@ -1,4 +1,4 @@
-import { type PublicKey } from '@solana/web3.js';
+import { PublicKey } from '@solana/web3.js';
 
 /**
  * Type aliases for Solana/Rust numeric types.
@@ -70,11 +70,7 @@ export interface ProtocolConfig {
  * Utility helper for consumers that need PublicKey objects.
  */
 export function configFieldToPublicKey(field: Uint8Array): PublicKey {
-  // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
-  const { PublicKey: PubKeyClass } = require('@solana/web3.js') as {
-    PublicKey: new (value: Uint8Array) => PublicKey;
-  };
-  return new PubKeyClass(field);
+  return new PublicKey(field);
 }
 
 /**
