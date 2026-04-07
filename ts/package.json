@@ -24,7 +24,7 @@
     "!src/**/*.d.ts.map"
   ],
   "scripts": {
-    "build": "tsup src/index.ts --format cjs,esm --dts --clean",
+    "build": "tsup src/index.ts --format cjs,esm --dts --clean && node -e \"if(require('fs').readFileSync('dist/index.mjs','utf8').includes('__require')){console.error('ERROR: __require shim detected in ESM build — a require() call is leaking into the browser bundle');process.exit(1)}\"",
     "dev": "tsup src/index.ts --format cjs,esm --dts --watch",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -42,6 +42,7 @@
     "@solana/rpc-api": "^2.0.0",
     "@solana/transactions": "^2.0.0",
     "@solana/compat": "^2.0.0",
+    "@solana/spl-token": "^0.4.0",
     "@solana/web3.js": "^1.91.0"
   },
   "devDependencies": {
