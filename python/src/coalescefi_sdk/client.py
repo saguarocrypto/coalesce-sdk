@@ -18,9 +18,11 @@ from solders.transaction import Transaction
 
 from .accounts import (
     RetryConfig,
+    fetch_lender_position,
     fetch_market,
     fetch_protocol_config,
 )
+from .math import calculate_scaled_amount
 from .errors import SdkError
 from .constants import (
     DEFAULT_PROGRAM_IDS,
@@ -226,6 +228,14 @@ class CoalesceClient:
     ) -> list[Instruction]:
         """Build instruction(s) for a lender withdrawal.
 
+        ``scaled_amount`` is a u128 scaled-share quantity, **not** a token amount.
+        To withdraw a USDC amount, convert with
+        :func:`coalescefi_sdk.math.calculate_scaled_amount` (``amount * WAD /
+        scale_factor``) or use the convenience method :meth:`withdraw_by_usdc`.
+        Pass ``scaled_amount=0`` for a full withdrawal; the program reads
+        ``scaled_balance`` from the on-chain ``LenderPosition``, which avoids
+        stranding 1 scaled unit from integer-division rounding.
+
         Args:
             lender: The lender's wallet public key (signer).
             market_pda: The market PDA.
@@ -303,6 +313,69 @@ class CoalesceClient:
             self.program_id,
         )
         return [*withdraw_ixs, close_ix]
+
+    async def withdraw_by_usdc(
+        self,
+        lender: Pubkey,
+        market_pda: Pubkey,
+        usdc_base_units: int,
+        *,
+        min_payout: int = 0,
+        lender_token_account: Pubkey | None = None,
+    ) -> list[Instruction]:
+        """Build a withdraw instruction targeting a USDC amount.
+
+        Converts ``usdc_base_units`` to the corresponding scaled-share quantity
+        via the market's current ``scale_factor``, then fetches the lender's
+        on-chain ``LenderPosition`` and clamps the result to that balance. The
+        clamp absorbs the 1-unit overshoot that can come out of the
+        floor-division roundtrip when the caller targets their full balance.
+
+        For a guaranteed full withdrawal — including reclaiming the final scaled
+        unit that integer rounding can strand — call :meth:`withdraw` with
+        ``scaled_amount=0`` or :meth:`withdraw_and_close` instead.
+
+        Args:
+            lender: The lender's wallet public key (signer).
+            market_pda: The market PDA.
+            usdc_base_units: Desired USDC amount in base units (1 USDC = 1_000_000).
+            min_payout: Minimum payout for slippage protection (u64, default 0).
+            lender_token_account: Override for the lender's token account.
+
+        Returns:
+            A list containing the withdraw instruction.
+
+        Raises:
+            SdkError: validation — usdc_base_units is zero, the market's
+                scale_factor is zero, the lender has no position on the market,
+                or the position is empty.
+        """
+        if usdc_base_units <= 0:
+            raise SdkError("usdc_base_units must be greater than 0", "validation")
+        market = await self._get_market(market_pda)
+        if market.scale_factor == 0:
+            raise SdkError(
+                "market scale_factor is 0; cannot convert USDC to scaled", "validation"
+            )
+        lender_position_pda, _ = find_lender_position_pda(market_pda, lender, self.program_id)
+        position = await fetch_lender_position(self.connection, lender_position_pda)
+        if position is None:
+            raise SdkError(
+                f"no lender position for {lender} on this market", "validation"
+            )
+        if position.scaled_balance == 0:
+            raise SdkError("lender position is empty", "validation")
+
+        requested = calculate_scaled_amount(usdc_base_units, market.scale_factor)
+        clamped = min(requested, position.scaled_balance)
+
+        return await self.withdraw(
+            lender,
+            market_pda,
+            scaled_amount=clamped,
+            min_payout=min_payout,
+            lender_token_account=lender_token_account,
+        )
 
     def close_lender_position(
         self,

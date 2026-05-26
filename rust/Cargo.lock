@@ -703,6 +703,8 @@ name = "coalescefi-sdk"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "reqwest",
+ "serde_json",
  "solana-client",
  "solana-program",
  "solana-sdk",

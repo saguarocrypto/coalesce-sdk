@@ -41,22 +41,43 @@ function buildProtocolConfigData(blacklistProgram: PublicKey): Uint8Array {
   return buffer;
 }
 
-function buildMarketData(borrower: PublicKey, mint: PublicKey, vault: PublicKey): Uint8Array {
+function buildMarketData(
+  borrower: PublicKey,
+  mint: PublicKey,
+  vault: PublicKey,
+  scaleFactorWad?: bigint
+): Uint8Array {
   const buffer = new Uint8Array(MARKET_SIZE);
   buffer.set(DISC_MARKET, 0);
   buffer[8] = 1; // version
   buffer.set(borrower.toBytes(), 9); // borrower at offset 9
   buffer.set(mint.toBytes(), 41); // mint at offset 41
   buffer.set(vault.toBytes(), 73); // vault at offset 73
+  // scale_factor at offset 148 (u128 LE, 16 bytes) — optional, defaults to 0
+  if (scaleFactorWad !== undefined) {
+    const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+    view.setBigUint64(148, scaleFactorWad & 0xffffffffffffffffn, true);
+    view.setBigUint64(156, scaleFactorWad >> 64n, true);
+  }
   return buffer;
 }
 
-function buildLenderPositionData(market: PublicKey, lender: PublicKey): Uint8Array {
+function buildLenderPositionData(
+  market: PublicKey,
+  lender: PublicKey,
+  scaledBalance?: bigint
+): Uint8Array {
   const buffer = new Uint8Array(LENDER_POSITION_SIZE);
   buffer.set(DISC_LENDER_POSITION, 0);
   buffer[8] = 1; // version
   buffer.set(market.toBytes(), 9); // market at offset 9
   buffer.set(lender.toBytes(), 41); // lender at offset 41
+  // scaled_balance at offset 73 (u128 LE, 16 bytes) — optional, defaults to 0
+  if (scaledBalance !== undefined) {
+    const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+    view.setBigUint64(73, scaledBalance & 0xffffffffffffffffn, true);
+    view.setBigUint64(81, scaledBalance >> 64n, true);
+  }
   return buffer;
 }
 
@@ -187,6 +208,78 @@ describe('CoalesceClient', () => {
       // scaledAmount is u128 LE at bytes 1-16, should be all zeros
       const scaledAmountBytes = ixs[0].data.subarray(1, 17);
       expect(scaledAmountBytes.every((b) => b === 0)).toBe(true);
+    });
+  });
+
+  describe('withdrawByUsdc', () => {
+    // 1 USDC = 1_000_000 base units. scale_factor of 1.027772 WAD means 1 share ≈ 1.027772 USDC.
+    const SCALE_FACTOR = 1_027_772_191_401_129_296n;
+    const LENDER_SCALED_BALANCE = 4_999_329n;
+
+    function seedPosition(scaledBalance: bigint, sf: bigint = SCALE_FACTOR): void {
+      accountDataMap.set(
+        marketPda.toBase58(),
+        buildMarketData(borrower.publicKey, mint, vault, sf)
+      );
+      const [positionPda] = findLenderPositionPda(marketPda, lender.publicKey, TEST_PROGRAM_ID);
+      accountDataMap.set(
+        positionPda.toBase58(),
+        buildLenderPositionData(marketPda, lender.publicKey, scaledBalance)
+      );
+    }
+
+    it('converts USDC base units to scaled and emits a single Withdraw ix', async () => {
+      seedPosition(LENDER_SCALED_BALANCE);
+      // floor(1_000_000 * 1e18 / 1_027_772_191_401_129_296) = 972_978 scaled shares.
+      const ixs = await client.withdrawByUsdc(lender.publicKey, marketPda, 1_000_000n);
+      expect(ixs).toHaveLength(1);
+      expect(ixs[0].data[0]).toBe(InstructionDiscriminator.Withdraw);
+      // scaled_amount at bytes 1..17 (u128 LE)
+      const view = new DataView(ixs[0].data.buffer, ixs[0].data.byteOffset, ixs[0].data.byteLength);
+      const scaled = view.getBigUint64(1, true) | (view.getBigUint64(9, true) << 64n);
+      expect(scaled).toBe(972_978n);
+    });
+
+    it('clamps to the on-chain scaledBalance when conversion overshoots', async () => {
+      seedPosition(LENDER_SCALED_BALANCE);
+      // ChRiS's mainnet case: 5.14 USDC requested but balance is 4_999_329 shares
+      // (worth ~5.138 USDC). Conversion would overshoot; clamp must absorb it.
+      const ixs = await client.withdrawByUsdc(lender.publicKey, marketPda, 5_140_000n);
+      const view = new DataView(ixs[0].data.buffer, ixs[0].data.byteOffset, ixs[0].data.byteLength);
+      const scaled = view.getBigUint64(1, true) | (view.getBigUint64(9, true) << 64n);
+      expect(scaled).toBe(LENDER_SCALED_BALANCE);
+    });
+
+    it('throws when the lender has no position on the market', async () => {
+      // Don't seed a position — only the market.
+      accountDataMap.set(
+        marketPda.toBase58(),
+        buildMarketData(borrower.publicKey, mint, vault, SCALE_FACTOR)
+      );
+      await expect(client.withdrawByUsdc(lender.publicKey, marketPda, 1_000_000n)).rejects.toThrow(
+        /No lender position/
+      );
+    });
+
+    it('throws when the position exists but is empty', async () => {
+      seedPosition(0n);
+      await expect(client.withdrawByUsdc(lender.publicKey, marketPda, 1_000_000n)).rejects.toThrow(
+        /position is empty/
+      );
+    });
+
+    it('throws when scale_factor is zero', async () => {
+      seedPosition(LENDER_SCALED_BALANCE, 0n);
+      await expect(client.withdrawByUsdc(lender.publicKey, marketPda, 1_000_000n)).rejects.toThrow(
+        /scale_factor is 0/
+      );
+    });
+
+    it('throws when usdcBaseUnits is zero or negative', async () => {
+      seedPosition(LENDER_SCALED_BALANCE);
+      await expect(client.withdrawByUsdc(lender.publicKey, marketPda, 0n)).rejects.toThrow(
+        /greater than 0/
+      );
     });
   });
 

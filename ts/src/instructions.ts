@@ -692,6 +692,13 @@ export function createRepayInstruction(
  * On-chain account order: [market, lender, lender_token, vault, lender_position, market_authority, blacklist_check, protocol_config, token_program, haircut_state]
  * Data layout: [scaled_amount(16 bytes, u128), min_payout(8 bytes, u64)]
  *
+ * UNITS NOTE: `scaled_amount` is a u128 share quantity, NOT a token amount.
+ * To withdraw a USDC amount, convert via
+ * `calculateScaledAmount(amountBaseUnits, market.scaleFactor)`. Pass
+ * `scaled_amount = 0` to withdraw the lender's full balance — the program
+ * reads `scaled_balance` from the on-chain `LenderPosition`, which avoids
+ * stranding 1 scaled unit from integer-division rounding.
+ *
  * SECURITY NOTE: The min_payout parameter provides slippage protection.
  * In distressed markets (settlement_factor < WAD), the actual payout may be
  * less than expected. Set min_payout to protect against receiving less than

@@ -40,6 +40,7 @@ import {
   createSetAdminInstruction,
   createSetWhitelistManagerInstruction,
 } from './instructions';
+import { calculateScaledAmount } from './math';
 import {
   findMarketPda,
   findLenderPositionPda,
@@ -155,6 +156,21 @@ export class CoalesceClient {
     }, 'deposit');
   }
 
+  /**
+   * Build a withdraw instruction.
+   *
+   * @param scaledAmount - u128 scaled-share quantity to burn. **This is NOT a token amount.**
+   *   To withdraw a USDC amount, convert with `calculateScaledAmount(amount, market.scaleFactor)`
+   *   or use the convenience method `withdrawByUsdc()`.
+   *   Pass `0n` to withdraw the lender's full balance; the program reads the current
+   *   `scaled_balance` on-chain, which avoids stranding 1 unit from integer-division rounding.
+   * @param overrides.minPayout - Minimum acceptable payout in token base units. `0n` disables
+   *   slippage protection. In distressed markets (settlement_factor < WAD) the actual payout
+   *   may be less than the entitled amount.
+   *
+   * @remarks First withdrawal after maturity triggers a settlement-factor lock. A 5-minute
+   *   grace period (SETTLEMENT_GRACE_PERIOD) prevents front-running.
+   */
   async withdraw(
     lender: PublicKey,
     marketPda: PublicKey,
@@ -220,6 +236,54 @@ export class CoalesceClient {
 
       return [...withdrawIxs, closeIx];
     }, 'withdrawAndClose');
+  }
+
+  /**
+   * Build a withdraw instruction targeting a USDC amount.
+   *
+   * Converts `usdcBaseUnits` to the corresponding scaled-share quantity via the
+   * market's current `scale_factor`, then fetches the lender's on-chain
+   * `LenderPosition` and clamps the result to that balance. The clamp absorbs
+   * the 1-unit overshoot that can come out of the floor-division roundtrip when
+   * the caller targets their full balance.
+   *
+   * For a guaranteed full withdrawal — including reclaiming the final scaled
+   * unit that integer rounding can strand — call `withdraw(lender, market, 0n)`
+   * or `withdrawAndClose(lender, market)` instead.
+   *
+   * @throws SdkError('validation') if the lender has no position on this market,
+   *   the position is empty, or the market's `scale_factor` is zero.
+   */
+  async withdrawByUsdc(
+    lender: PublicKey,
+    marketPda: PublicKey,
+    usdcBaseUnits: bigint,
+    overrides?: WithdrawOverrides
+  ): Promise<TransactionInstruction[]> {
+    return this.wrap(async () => {
+      if (usdcBaseUnits <= 0n) {
+        throw new SdkError('usdcBaseUnits must be greater than 0', 'validation');
+      }
+      const market = await this.cache.getMarket(this.connection, marketPda);
+      if (market.scaleFactor === 0n) {
+        throw new SdkError('Market scale_factor is 0; cannot convert USDC to scaled', 'validation');
+      }
+      const [lenderPositionPda] = findLenderPositionPda(marketPda, lender, this.programId);
+      const position = await fetchLenderPosition(this.connection, lenderPositionPda);
+      if (position === null) {
+        throw new SdkError(
+          `No lender position for ${lender.toBase58()} on this market`,
+          'validation'
+        );
+      }
+      if (position.scaledBalance === 0n) {
+        throw new SdkError('Lender position is empty', 'validation');
+      }
+      const requestedScaled = calculateScaledAmount(usdcBaseUnits, market.scaleFactor);
+      const clamped =
+        requestedScaled > position.scaledBalance ? position.scaledBalance : requestedScaled;
+      return this.withdraw(lender, marketPda, clamped, overrides);
+    }, 'withdrawByUsdc');
   }
 
   /** Close an empty lender position to reclaim rent. Position must have zero balance and zero haircut_owed. */

@@ -315,6 +315,37 @@ const withdrawExcessIx = createWithdrawExcessInstruction({
 await sendAndConfirmTransaction(connection, new Transaction().add(withdrawExcessIx), [borrower]);
 ```
 
+## Amounts and Units
+
+`LenderPosition.scaledBalance` and the withdraw instruction's `scaledAmount` are
+u128 **share quantities**, not token amounts. To convert between shares and
+USDC base units, use the helpers in `math`:
+
+```ts
+import { calculateNormalizedAmount, calculateScaledAmount } from '@coalescefi/sdk';
+
+// Lender's current USDC claim from their scaled balance:
+const claim = calculateNormalizedAmount(position.scaledBalance, market.scaleFactor);
+// → token base units (e.g. divide by 10**6 for USDC)
+
+// Shares to burn to withdraw a specific USDC amount:
+const sharesToBurn = calculateScaledAmount(usdcBaseUnits, market.scaleFactor);
+```
+
+For a withdraw flow, prefer one of these higher-level paths over hand-rolling
+the conversion:
+
+| Goal                          | Use                                                    |
+| ----------------------------- | ------------------------------------------------------ |
+| Withdraw a USDC amount        | `client.withdrawByUsdc(lender, market, usdcBaseUnits)` |
+| Withdraw the full balance     | `client.withdraw(lender, market, 0n)` (sentinel)       |
+| Withdraw all + close position | `client.withdrawAndClose(lender, market)`              |
+
+The `0n` sentinel is the only way to guarantee no scaled-unit dust is left
+behind: the program reads `scaled_balance` from the on-chain `LenderPosition`,
+which avoids the integer-division rounding that would otherwise strand 1 share
+and block `close_lender_position` with `PositionNotEmpty`.
+
 ## Reading On-Chain State
 
 ```ts

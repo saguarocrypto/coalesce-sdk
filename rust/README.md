@@ -367,6 +367,37 @@ let tx = Transaction::new_signed_with_payer(
 client.send_and_confirm_transaction(&tx).unwrap();
 ```
 
+## Amounts and Units
+
+`LenderPosition::scaled_balance` and the withdraw instruction's `scaled_amount`
+are u128 **share quantities**, not token amounts. To convert between shares and
+USDC base units, use the helpers in `math`:
+
+```rust
+use coalescefi_sdk::math::{calculate_normalized_amount, calculate_scaled_amount};
+
+// Lender's current USDC claim from their scaled balance:
+let claim = calculate_normalized_amount(position.scaled_balance(), market.scale_factor())?;
+// → token base units (divide by 10^6 for USDC)
+
+// Shares to burn to withdraw a specific USDC amount:
+let shares_to_burn = calculate_scaled_amount(usdc_base_units, market.scale_factor())?;
+```
+
+For a withdraw flow, prefer one of these higher-level paths:
+
+| Goal                          | Use                                                                 |
+| ----------------------------- | ------------------------------------------------------------------- |
+| Withdraw a USDC amount        | `client.withdraw_by_usdc(lender, market, usdc_base_units, 0, None)` |
+| Withdraw the full balance     | `client.withdraw(lender, market, 0, 0, None)` (sentinel)            |
+| Withdraw all + close position | `client.withdraw_and_close(lender, market, 0, None)`                |
+
+The `scaled_amount = 0` sentinel is the only way to guarantee no scaled-unit
+dust is left behind: the program reads `scaled_balance` from the on-chain
+`LenderPosition`, which avoids the integer-division rounding that would
+otherwise strand 1 share and block `close_lender_position` with
+`PositionNotEmpty`.
+
 ## Reading On-Chain State
 
 Requires the `std` feature (enabled by default).
