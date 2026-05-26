@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `CoalesceClient.withdraw` and `createWithdrawInstruction` now document the `scaledAmount = 0n` sentinel for full withdrawals and direct callers to `calculateScaledAmount` / `withdrawByUsdc` instead of hand-rolling unit conversions.
 
+### Fixed
+
+- `withdrawByUsdc` rejects `usdcBaseUnits` values that floor-convert to 0 scaled shares (e.g. 1 base unit when `scale_factor >= WAD`). Without the guard the resulting `scaled_amount = 0n` would collide with the full-withdrawal sentinel and drain the entire position.
+
 ## [0.1.0] - 2026-02-27
 
 ### Added

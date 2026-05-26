@@ -280,6 +280,16 @@ export class CoalesceClient {
         throw new SdkError('Lender position is empty', 'validation');
       }
       const requestedScaled = calculateScaledAmount(usdcBaseUnits, market.scaleFactor);
+      // Guard: integer division can floor a sub-unit USDC input to 0 scaled
+      // shares (e.g. usdcBaseUnits=1 with scale_factor >= WAD). Passing 0 to
+      // `withdraw` triggers the full-withdrawal sentinel and drains the
+      // entire position — must reject explicitly.
+      if (requestedScaled === 0n) {
+        throw new SdkError(
+          'usdcBaseUnits too small: floor-converts to 0 scaled shares',
+          'validation'
+        );
+      }
       const clamped =
         requestedScaled > position.scaledBalance ? position.scaledBalance : requestedScaled;
       return this.withdraw(lender, marketPda, clamped, overrides);

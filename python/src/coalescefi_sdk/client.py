@@ -367,6 +367,15 @@ class CoalesceClient:
             raise SdkError("lender position is empty", "validation")
 
         requested = calculate_scaled_amount(usdc_base_units, market.scale_factor)
+        # Guard: integer division can floor a sub-unit USDC input to 0 scaled
+        # shares (e.g. usdc_base_units=1 with scale_factor >= WAD). Passing 0
+        # to `withdraw` triggers the full-withdrawal sentinel and drains the
+        # entire position — reject explicitly.
+        if requested == 0:
+            raise SdkError(
+                "usdc_base_units too small: floor-converts to 0 scaled shares",
+                "validation",
+            )
         clamped = min(requested, position.scaled_balance)
 
         return await self.withdraw(

@@ -281,6 +281,16 @@ describe('CoalesceClient', () => {
         /greater than 0/
       );
     });
+
+    it('rejects sub-unit usdcBaseUnits that floor-convert to 0 scaled (sentinel collision guard)', async () => {
+      seedPosition(LENDER_SCALED_BALANCE);
+      // 1 USDC base unit with scale_factor > WAD floors to 0 scaled shares.
+      // Without the explicit guard, `withdraw(0n)` would trigger the
+      // full-withdrawal sentinel and drain the entire position.
+      await expect(client.withdrawByUsdc(lender.publicKey, marketPda, 1n)).rejects.toThrow(
+        /too small/
+      );
+    });
   });
 
   describe('borrow', () => {
