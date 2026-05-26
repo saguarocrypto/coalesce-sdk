@@ -346,6 +346,37 @@ tx = Transaction.new_signed_with_payer([withdraw_excess_ix], borrower.pubkey(), 
 await client.send_transaction(tx)
 ```
 
+## Amounts and Units
+
+`LenderPosition.scaled_balance` and the withdraw instruction's `scaled_amount`
+are u128 **share quantities**, not token amounts. To convert between shares
+and USDC base units, use the helpers in `math`:
+
+```python
+from coalescefi_sdk import calculate_normalized_amount, calculate_scaled_amount
+
+# Lender's current USDC claim from their scaled balance:
+claim = calculate_normalized_amount(position.scaled_balance, market.scale_factor)
+# → token base units (divide by 10**6 for USDC)
+
+# Shares to burn to withdraw a specific USDC amount:
+shares_to_burn = calculate_scaled_amount(usdc_base_units, market.scale_factor)
+```
+
+For a withdraw flow, prefer one of these higher-level paths:
+
+| Goal                          | Use                                                                 |
+| ----------------------------- | ------------------------------------------------------------------- |
+| Withdraw a USDC amount        | `await client.withdraw_by_usdc(lender, market, usdc_base_units)`    |
+| Withdraw the full balance     | `await client.withdraw(lender, market, scaled_amount=0)` (sentinel) |
+| Withdraw all + close position | `await client.withdraw_and_close(lender, market)`                   |
+
+The `scaled_amount=0` sentinel is the only way to guarantee no scaled-unit
+dust is left behind: the program reads `scaled_balance` from the on-chain
+`LenderPosition`, which avoids the integer-division rounding that would
+otherwise strand 1 share and block `close_lender_position` with
+`PositionNotEmpty`.
+
 ## Reading On-Chain State
 
 ```python

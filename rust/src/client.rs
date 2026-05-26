@@ -21,12 +21,13 @@ use solana_sdk::signature::Signature;
 use solana_sdk::signer::Signer;
 use solana_sdk::transaction::Transaction;
 
-use crate::accounts::{fetch_market, fetch_protocol_config};
+use crate::accounts::{fetch_market, fetch_protocol_config, try_fetch_lender_position};
 use crate::constants::{
     devnet_program_id, localnet_program_id, mainnet_program_id, spl_token_program_id,
     system_program_id,
 };
 use crate::instructions::*;
+use crate::math::calculate_scaled_amount;
 use crate::pdas::*;
 use crate::types::*;
 
@@ -148,8 +149,15 @@ impl CoalesceClient {
 
     /// Build a withdraw instruction.
     ///
-    /// Pass `scaled_amount = 0` for a full withdrawal. `min_payout` provides
-    /// slippage protection (0 = disabled).
+    /// `scaled_amount` is a u128 scaled-share quantity, **not** a token amount.
+    /// To withdraw a USDC amount, convert with
+    /// `crate::math::calculate_scaled_amount(amount, market.scale_factor())` or use the
+    /// convenience method [`withdraw_by_usdc`](Self::withdraw_by_usdc).
+    ///
+    /// Pass `scaled_amount = 0` for a full withdrawal. The program reads the current
+    /// `scaled_balance` on-chain, which avoids stranding 1 scaled unit from
+    /// integer-division rounding. `min_payout` provides slippage protection
+    /// (`0` = disabled).
     pub fn withdraw(
         &self,
         lender: &Pubkey,
@@ -221,6 +229,67 @@ impl CoalesceClient {
 
         ixs.push(close_ix);
         Ok(ixs)
+    }
+
+    /// Build a withdraw instruction targeting a USDC amount.
+    ///
+    /// Converts `usdc_base_units` to the corresponding scaled-share quantity via the
+    /// market's current `scale_factor`, then fetches the lender's on-chain
+    /// `LenderPosition` and clamps the result to that balance. The clamp absorbs
+    /// the 1-unit overshoot that can come out of the floor-division roundtrip when
+    /// the caller targets their full balance.
+    ///
+    /// For a guaranteed full withdrawal — including reclaiming the final scaled
+    /// unit that integer rounding can strand — call
+    /// [`withdraw`](Self::withdraw) with `scaled_amount = 0` or
+    /// [`withdraw_and_close`](Self::withdraw_and_close) instead.
+    ///
+    /// Returns `ClientError` if the lender has no position on the market, the
+    /// position is empty, the market's `scale_factor` is zero, or `usdc_base_units`
+    /// is zero.
+    pub fn withdraw_by_usdc(
+        &self,
+        lender: &Pubkey,
+        market_pda: &Pubkey,
+        usdc_base_units: u64,
+        min_payout: u64,
+        lender_token_account_override: Option<Pubkey>,
+    ) -> Result<Vec<Instruction>, ClientError> {
+        if usdc_base_units == 0 {
+            return Err(ClientError::Validation(
+                "usdc_base_units must be greater than 0".to_string(),
+            ));
+        }
+        let market = fetch_market(&self.rpc, market_pda)?;
+        let scale_factor = market.scale_factor();
+        if scale_factor == 0 {
+            return Err(ClientError::Validation(
+                "market scale_factor is 0; cannot convert USDC to scaled".to_string(),
+            ));
+        }
+        let lender_position_pda = find_lender_position_pda(market_pda, lender, &self.program_id).address;
+        // Use `try_fetch_lender_position` so a missing account surfaces as a
+        // descriptive validation error instead of being collapsed into an
+        // opaque `InvalidAddress` by the non-`try_` fetcher.
+        let position = try_fetch_lender_position(&self.rpc, &lender_position_pda)?.ok_or_else(
+            || ClientError::Validation(format!("no lender position for {lender} on this market")),
+        )?;
+        let scaled_balance = position.scaled_balance();
+        if scaled_balance == 0 {
+            return Err(ClientError::Validation(
+                "lender position is empty".to_string(),
+            ));
+        }
+
+        let clamped = resolve_withdraw_scaled(usdc_base_units, scale_factor, scaled_balance)?;
+
+        self.withdraw(
+            lender,
+            market_pda,
+            clamped,
+            min_payout,
+            lender_token_account_override,
+        )
     }
 
     /// Build a close lender position instruction.
@@ -695,5 +764,74 @@ impl CoalesceClient {
         let config = fetch_protocol_config(&self.rpc, &config_pda)?;
         let blacklist_program = config.blacklist_program_pubkey();
         Ok(find_blacklist_check_pda(address, &blacklist_program).address)
+    }
+}
+
+/// Convert a USDC base-unit amount to the scaled-share quantity to pass into
+/// `withdraw`, clamped to the lender's on-chain `scaled_balance`.
+///
+/// Extracted as a free function so the conversion + clamp + sub-unit guard
+/// can be unit-tested without mocking `RpcClient`. The clamp absorbs the
+/// 1-unit overshoot at the upper boundary; the sub-unit guard rejects inputs
+/// that floor to 0 scaled shares (which would otherwise collide with the
+/// full-withdrawal sentinel and drain the position).
+pub(crate) fn resolve_withdraw_scaled(
+    usdc_base_units: u64,
+    scale_factor: u128,
+    scaled_balance: u128,
+) -> Result<u128, ClientError> {
+    let requested = calculate_scaled_amount(usdc_base_units, scale_factor)
+        .map_err(|e| ClientError::Validation(format!("calculate_scaled_amount: {e:?}")))?;
+    if requested == 0 {
+        return Err(ClientError::Validation(
+            "usdc_base_units too small: floor-converts to 0 scaled shares".to_string(),
+        ));
+    }
+    Ok(requested.min(scaled_balance))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Real on-chain values from the mainnet withdraw failure that motivated
+    // this method. Documented so any future refactor can recompute against
+    // ground truth instead of trusting the numbers blindly.
+    const SCALE_FACTOR: u128 = 1_027_772_191_401_129_296; // ~1.027772 WAD
+    const SCALED_BALANCE: u128 = 4_999_329;
+
+    #[test]
+    fn partial_withdraw_within_balance_converts_via_calculate_scaled_amount() {
+        // 1 USDC → floor(1_000_000 * 1e18 / SCALE_FACTOR) = 972_978 scaled.
+        let scaled = resolve_withdraw_scaled(1_000_000, SCALE_FACTOR, SCALED_BALANCE).unwrap();
+        assert_eq!(scaled, 972_978);
+    }
+
+    #[test]
+    fn clamps_to_scaled_balance_when_conversion_overshoots() {
+        // The mainnet bug: 5.14 USDC requested but balance is ~5.138 USDC
+        // worth of shares. Conversion overshoots — clamp must absorb it.
+        let scaled = resolve_withdraw_scaled(5_140_000, SCALE_FACTOR, SCALED_BALANCE).unwrap();
+        assert_eq!(scaled, SCALED_BALANCE);
+    }
+
+    #[test]
+    fn rejects_sub_unit_usdc_to_prevent_sentinel_collision() {
+        // 1 base unit (0.000001 USDC) floor-converts to 0 scaled shares
+        // because SCALE_FACTOR > WAD. Without the guard the caller would
+        // pass 0 into `withdraw`, hitting the full-withdrawal sentinel and
+        // draining the position.
+        let err = resolve_withdraw_scaled(1, SCALE_FACTOR, SCALED_BALANCE).unwrap_err();
+        match err {
+            ClientError::Validation(msg) => assert!(msg.contains("too small"), "msg: {msg}"),
+            other => panic!("expected Validation, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_zero_scale_factor() {
+        let err = resolve_withdraw_scaled(1_000_000, 0, SCALED_BALANCE).unwrap_err();
+        // `calculate_scaled_amount` errors first; we propagate as Validation.
+        assert!(matches!(err, ClientError::Validation(_)));
     }
 }
