@@ -243,6 +243,16 @@ const ERROR_PATTERNS = [
   /custom program error:\s*(\d+)(?!\s*x)/i,
   // Decimal in Custom(): "Custom({decimal})"
   /Custom\s*\(\s*(\d+)\s*\)/,
+  // JSON-serialised TransactionError: '{"InstructionError":[0,{"Custom":4}]}'.
+  // Some callers JSON.stringify the RPC error into an Error message before
+  // it reaches the SDK, so the structured object is already gone by then.
+  // NOTE: this matches any `"Custom": N` in the string regardless of which
+  // instruction produced it. For a single-instruction transaction there is
+  // exactly one candidate. If a multi-instruction transaction is sent, this
+  // reports the FIRST custom error in the payload, which may belong to an
+  // instruction the caller did not ask about — read the instruction index
+  // from the structured error instead.
+  /"Custom"\s*:\s*(\d+)/,
   // Anchor-style: "Error Code: {code}"
   /Error Code:\s*(\d+)/i,
   // Program error format: "Program failed with error: {code}"
@@ -265,15 +275,28 @@ function extractErrorCodeFromLog(log: string): number | null {
   for (const pattern of ERROR_PATTERNS) {
     const match = log.match(pattern);
     if (match?.[1] !== undefined && match[1] !== '') {
-      // Check if it's a hex pattern (0x prefix or hex-only pattern)
-      const isHexPattern = pattern.source.includes('0x') || /^[0-9a-fA-F]+$/.test(match[1]);
-      const base = isHexPattern && /^[0-9a-fA-F]+$/.test(match[1]) ? 16 : 10;
+      // Only the `0x`-prefixed patterns capture hex. Every other pattern
+      // captures `\d+`, so it must be read as decimal — inferring the base from
+      // the captured digits alone would read "Custom(12)" as 0x12.
+      const base = pattern.source.includes('0x') ? 16 : 10;
 
       const code = parseInt(match[1], base);
       if (!isNaN(code) && code >= 0 && code <= 0xffffffff) {
         return code;
       }
     }
+  }
+
+  // Decoded form: "Program error: {CodeName} — {message}". A caller may decode
+  // a simulation error through this module and rethrow the friendly text, so
+  // the numeric code is gone by the time the SDK sees it again; recover it
+  // from the code name via the enum's reverse mapping.
+  const nameMatch = /Program error:\s*([A-Za-z][A-Za-z0-9]*)/.exec(log);
+  const namedCode = (CoalescefiErrorCode as unknown as Record<string, number | undefined>)[
+    nameMatch?.[1] ?? ''
+  ];
+  if (typeof namedCode === 'number') {
+    return namedCode;
   }
 
   return null;
@@ -289,11 +312,52 @@ function extractErrorCodeFromLog(log: string): number | null {
  * - InstructionError with Custom code
  * - TransactionError format
  * - Nested error objects
+ * - Wallet-connector wrappers that nest the cause under a non-standard property
  *
  * @param error - The error to parse (can be any type)
  * @returns CoalescefiError if parsing succeeds, null otherwise
  */
 export function parseCoalescefiError(error: unknown): CoalescefiError | null {
+  return parseCoalescefiErrorNode(error, new Set<object>(), {
+    remaining: MAX_ERROR_PARSE_NODES,
+  });
+}
+
+/**
+ * Non-standard properties under which error wrappers stash the error they wrapped.
+ *
+ * `@solana/connector` builds `TransactionError('SEND_FAILED', 'Failed to send
+ * transaction', undefined, rpcError)` and stores `rpcError` on `originalError`
+ * without ever populating the standard `cause`. Its own message is a fixed
+ * literal, so the program's custom error code is only reachable through this
+ * property — without it a nonce collision surfaced through a web wallet looks
+ * like a generic send failure and the create-market retry never fires.
+ */
+const WRAPPED_ERROR_PROPERTIES = ['originalError'] as const;
+
+/**
+ * Distinct error objects one `parseCoalescefiError` call may expand.
+ *
+ * A work budget rather than a depth cap: a depth cap has to be tight enough to
+ * bound the stack, which puts it uncomfortably close to the length of chains
+ * that legitimately occur (a connector double-wrap around an RPC error is
+ * already 4 links, and nothing stops a wallet from adding more), and a chain
+ * one link too long silently loses its error code. A budget over distinct
+ * objects bounds both the stack and the total work regardless of how the
+ * wrapper graph fans out, while leaving ~100x headroom over any real chain.
+ */
+const MAX_ERROR_PARSE_NODES = 512;
+
+/**
+ * @param expanded - every object whose properties have already been read, for
+ *   the whole parse
+ * @param budget - shared, mutable count of objects still allowed to be expanded
+ */
+function parseCoalescefiErrorNode(
+  error: unknown,
+  expanded: Set<object>,
+  budget: { remaining: number }
+): CoalescefiError | null {
   // Already a CoalescefiError
   if (error instanceof CoalescefiError) {
     return error;
@@ -315,6 +379,46 @@ export function parseCoalescefiError(error: unknown): CoalescefiError | null {
     }
     return null;
   }
+
+  // Expand each object at most once per parse. The strategies below are pure
+  // functions of the graph, so a second expansion can only reproduce the first
+  // one's answer — and re-expanding is not merely wasted work, it is charged
+  // to the budget: a wrapper whose `err` and `error` point at the same child
+  // doubles the cost at every level, so eight such wrappers (11 objects, no
+  // cycle) exhaust a 512-unit budget and starve everything the traversal has
+  // not reached yet.
+  //
+  // Because an object is recorded BEFORE its properties are read, this is also
+  // the cycle guard: a back edge to anything on the current path finds it
+  // already present. A separate path-local set would be dead code — every
+  // ancestor is, by construction, already in here.
+  if (expanded.has(error)) {
+    return null;
+  }
+
+  // Work budget: bounds the number of distinct objects expanded, which bounds
+  // both stack depth and total work however the graph is shaped.
+  if (budget.remaining <= 0) {
+    return null;
+  }
+  budget.remaining -= 1;
+  expanded.add(error);
+
+  return parseErrorObjectStrategies(error, expanded, budget);
+}
+
+/**
+ * Run the parsing strategies against a single error object, in precedence
+ * order. Recursion into nested errors goes back through
+ * {@link parseCoalescefiErrorNode} so every node passes the guards above.
+ */
+function parseErrorObjectStrategies(
+  error: object,
+  expanded: Set<object>,
+  budget: { remaining: number }
+): CoalescefiError | null {
+  const recurse = (nested: unknown): CoalescefiError | null =>
+    parseCoalescefiErrorNode(nested, expanded, budget);
 
   const errorObj = error as Record<string, unknown>;
 
@@ -359,7 +463,7 @@ export function parseCoalescefiError(error: unknown): CoalescefiError | null {
 
   // Strategy 3: Nested error in 'err' field (TransactionError format)
   if ('err' in errorObj && errorObj.err !== null) {
-    const nestedResult = parseCoalescefiError(errorObj.err);
+    const nestedResult = recurse(errorObj.err);
     if (nestedResult) {
       return nestedResult;
     }
@@ -367,7 +471,7 @@ export function parseCoalescefiError(error: unknown): CoalescefiError | null {
 
   // Strategy 4: Nested error in 'error' field
   if ('error' in errorObj && errorObj.error !== null) {
-    const nestedResult = parseCoalescefiError(errorObj.error);
+    const nestedResult = recurse(errorObj.error);
     if (nestedResult) {
       return nestedResult;
     }
@@ -383,13 +487,89 @@ export function parseCoalescefiError(error: unknown): CoalescefiError | null {
 
   // Strategy 6: Check cause chain (Error objects)
   if (error instanceof Error && error.cause !== undefined) {
-    const causeResult = parseCoalescefiError(error.cause);
+    const causeResult = recurse(error.cause);
     if (causeResult) {
       return causeResult;
     }
   }
 
+  // Strategy 7: Check non-standard wrapper properties used by wallet connectors,
+  // which nest the RPC error without populating the standard `cause`.
+  for (const property of WRAPPED_ERROR_PROPERTIES) {
+    if (property in errorObj && errorObj[property] !== null) {
+      const wrappedResult = recurse(errorObj[property]);
+      if (wrappedResult) {
+        return wrappedResult;
+      }
+    }
+  }
+
   return null;
+}
+
+/**
+ * Runtime log line naming the program whose instruction failed, e.g.
+ * `Program GooseA4... failed: custom program error: 0x4`.
+ */
+const PROGRAM_FAILED_LOG = /^Program ([1-9A-HJ-NP-Za-km-z]{32,44}) failed:/;
+
+/**
+ * Base58 ids of every program the runtime blamed for a failure, taken from any
+ * `logs` array reachable in the error graph.
+ *
+ * A custom error code on its own says nothing about WHICH program produced it:
+ * `Custom(4)` means `MarketAlreadyExists` in this program and something else
+ * entirely in any other. Transaction logs are the one shape that carries the
+ * attribution, so callers that must not act on a foreign program's code — the
+ * create-market retry, which spends a wallet signature — check here first.
+ *
+ * Returns an empty array when the error carries no logs (a stringified message
+ * or a bare `InstructionError` has nothing to attribute), so callers must
+ * decide what an unattributable code means for them rather than reading empty
+ * as "not ours".
+ *
+ * Uses the same expansion budget and cycle handling as
+ * {@link parseCoalescefiError}; see {@link MAX_ERROR_PARSE_NODES}.
+ */
+export function findFailedProgramIds(error: unknown): string[] {
+  const ids: string[] = [];
+  const expanded = new Set<object>();
+  const budget = { remaining: MAX_ERROR_PARSE_NODES };
+
+  const walk = (node: unknown): void => {
+    if (node === null || typeof node !== 'object') {
+      return;
+    }
+    if (expanded.has(node) || budget.remaining <= 0) {
+      return;
+    }
+    budget.remaining -= 1;
+    expanded.add(node);
+
+    const errorObj = node as Record<string, unknown>;
+    if (Array.isArray(errorObj.logs)) {
+      for (const log of errorObj.logs) {
+        if (typeof log === 'string') {
+          const programId = PROGRAM_FAILED_LOG.exec(log)?.[1];
+          if (programId !== undefined) {
+            ids.push(programId);
+          }
+        }
+      }
+    }
+
+    walk(errorObj.err);
+    walk(errorObj.error);
+    if (node instanceof Error) {
+      walk(node.cause);
+    }
+    for (const property of WRAPPED_ERROR_PROPERTIES) {
+      walk(errorObj[property]);
+    }
+  };
+
+  walk(error);
+  return ids;
 }
 
 /**

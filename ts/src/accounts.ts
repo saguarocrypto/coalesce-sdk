@@ -11,7 +11,10 @@ import {
   DISC_LENDER_POSITION,
   DISC_BORROWER_WL,
   DISC_HAIRCUT_STATE,
+  getProgramId,
 } from './constants';
+import { SdkError } from './errors';
+import { findMarketPda } from './pdas';
 import {
   type ProtocolConfig,
   type Market,
@@ -490,4 +493,189 @@ export function decodeAccount(
     default:
       return null;
   }
+}
+
+/** Nonces probed per RPC round trip. */
+const NONCE_PROBE_BATCH_SIZE = 16;
+
+/**
+ * Default width of the probe window, counting up from the floor.
+ *
+ * A cost bound on the probe, not a limit on how many markets a borrower may
+ * have: `market_nonce` is a u64 on-chain and nothing about the program caps it.
+ * At the default batch size this is 16 RPC round trips worst case, which is
+ * already slow enough that quietly raising it would be the wrong default. A
+ * borrower who genuinely holds this many dense nonces raises {@link
+ * FindNextMarketNonceOptions.maxProbe} (or lifts
+ * {@link FindNextMarketNonceOptions.minNonce} past the dense range) — the
+ * exhaustion error names both.
+ */
+const NONCE_PROBE_MAX = 256n;
+
+/** Exclusive upper bound of the nonce space: `market_nonce` is a u64 on-chain. */
+const NONCE_SPACE_END = 1n << 64n;
+
+/**
+ * Options for {@link findNextMarketNonce}.
+ */
+export interface FindNextMarketNonceOptions {
+  /** Nonces probed per getMultipleAccountsInfo call (default: 16) */
+  batchSize?: number;
+  /**
+   * How many nonces to probe before throwing (default: 256).
+   *
+   * A bound on probe cost, not on the borrower's markets — the on-chain nonce
+   * is a u64. Raise it (or raise `minNonce`) to search past a borrower whose
+   * first 256 slots from the floor are all taken; the exhaustion error says so
+   * explicitly rather than presenting the default as a wall.
+   *
+   * The window is relative to the floor: the probe covers
+   * `[minNonce, minNonce + maxProbe)`, clamped to the end of the u64 nonce
+   * space. Relative rather than absolute so that raising `minNonce` — which is
+   * exactly what the create-market retry does after a collision — shifts the
+   * window instead of shrinking it. An absolute ceiling would make a collision
+   * at nonce 255 retry with a floor of 256 and probe nothing at all.
+   */
+  maxProbe?: bigint;
+  /**
+   * Lowest nonce the probe may return (default: 0).
+   *
+   * Used to exclude a nonce already known to be taken — after a confirmed
+   * `MarketAlreadyExists` collision the chain has moved ahead of whatever this
+   * probe's RPC can see, so re-probing from 0 can hand back the very nonce that
+   * just collided.
+   */
+  minNonce?: bigint;
+  /** Retry behavior for the underlying RPC calls */
+  retryConfig?: RetryConfig;
+}
+
+/**
+ * Find the borrower's next unused market nonce by probing market PDA occupancy
+ * on-chain.
+ *
+ * Walks nonces upward from `minNonce` (default 0), testing each batch with a
+ * single `getMultipleAccountsInfo` call that requests zero account bytes — only
+ * the account's owner matters. The first unoccupied nonce wins.
+ *
+ * A slot counts as occupied only when its PDA is owned by the Coalesce program.
+ * A `null` account is free, and so is a system-owned account holding nothing but
+ * lamports: `create_market` funds the shortfall on a pre-funded PDA and then
+ * allocates it, so dust does not block creation. Treating any non-null account
+ * as occupied would hand anyone a griefing vector — 1 lamport sent to each of a
+ * borrower's first 256 market PDAs would lock them out of creating loans.
+ *
+ * Owner is the right occupancy signal rather than the account discriminator:
+ * only the Coalesce program can sign for a market PDA, so nothing else can
+ * create or assign one, and a program-owned PDA is therefore an initialised
+ * market. A discriminator check would also need account bytes, and reading them
+ * cannot make the answer safer — `create_market` rejects *any* program-owned
+ * account at the PDA, so treating one as free would only guarantee a failed
+ * transaction.
+ *
+ * This deliberately reads the chain rather than indexer data: a lagging indexer
+ * would otherwise hand back an already-occupied nonce and `create_market` would
+ * fail with `MarketAlreadyExists`. It also takes a `Connection` directly rather
+ * than going through `CoalesceClient`'s account cache, since a cached hit is the
+ * same staleness bug in another form.
+ *
+ * As of v1 of the protocol, there is no `CloseMarket` instruction — market
+ * accounts are never closed on-chain, so an occupied nonce stays occupied
+ * and a slot can never be freed or wrongly reused. If a future protocol
+ * version ever adds one, this probe must be revisited — a freed nonce slot
+ * would let it hand back an address that once held a different, now-closed
+ * market.
+ *
+ * @throws SdkError('network') if the probe cannot reach the chain
+ * @throws SdkError('validation') if no free nonce exists in the probe window
+ */
+export async function findNextMarketNonce(
+  connection: Connection,
+  borrower: PublicKey,
+  programId?: PublicKey,
+  options?: FindNextMarketNonceOptions
+): Promise<bigint> {
+  const batchSize = BigInt(options?.batchSize ?? NONCE_PROBE_BATCH_SIZE);
+  const maxProbe = options?.maxProbe ?? NONCE_PROBE_MAX;
+  const minNonce = options?.minNonce ?? 0n;
+  const resolvedProgramId = programId ?? getProgramId();
+
+  if (batchSize <= 0n) {
+    throw new SdkError(
+      `Invalid batchSize: ${batchSize.toString()}. Must be greater than 0.`,
+      'validation'
+    );
+  }
+
+  if (minNonce < 0n) {
+    throw new SdkError(
+      `Invalid minNonce: ${minNonce.toString()}. Must not be negative.`,
+      'validation'
+    );
+  }
+
+  if (maxProbe <= 0n) {
+    throw new SdkError(
+      `Invalid maxProbe: ${maxProbe.toString()}. Must be greater than 0.`,
+      'validation'
+    );
+  }
+
+  // Window relative to the floor, clamped so it can never run past the u64
+  // nonce space (`u64ToLEBytes` would reject the seed).
+  const probeEnd = minNonce + maxProbe > NONCE_SPACE_END ? NONCE_SPACE_END : minNonce + maxProbe;
+
+  for (let start = minNonce; start < probeEnd; start += batchSize) {
+    const candidates: bigint[] = [];
+    for (let offset = 0n; offset < batchSize && start + offset < probeEnd; offset++) {
+      candidates.push(start + offset);
+    }
+
+    const addresses = candidates.map(
+      (nonce) => findMarketPda(borrower, nonce, resolvedProgramId)[0]
+    );
+
+    let infos: Awaited<ReturnType<Connection['getMultipleAccountsInfo']>>;
+    try {
+      infos = await withRetry(
+        () =>
+          connection.getMultipleAccountsInfo(addresses, {
+            commitment: 'confirmed',
+            dataSlice: { offset: 0, length: 0 },
+          }),
+        options?.retryConfig
+      );
+    } catch (error) {
+      throw new SdkError(
+        "Couldn't check your existing loans — please try again.",
+        'network',
+        error instanceof Error ? error : undefined
+      );
+    }
+
+    // Free unless the PDA is owned by the program. A missing account (`null`)
+    // and a non-program owner (dust-funded, still system-owned) both leave the
+    // slot usable by `create_market` — see the doc comment above.
+    const freeIndex = infos.findIndex((info) => {
+      if (info === null || info === undefined) {
+        return true;
+      }
+      return !info.owner.equals(resolvedProgramId);
+    });
+    if (freeIndex !== -1) {
+      return candidates[freeIndex] as bigint;
+    }
+  }
+
+  // Name the bound that stopped the search and how to move it. The probe
+  // window is a client-side cost limit, not a protocol limit — `market_nonce`
+  // is a u64 — so a bare "no free nonce" would read as a permanent wall.
+  throw new SdkError(
+    `No free market nonce found in [${minNonce.toString()}, ${probeEnd.toString()}) ` +
+      `for borrower ${borrower.toBase58()}. The probe stops after maxProbe=` +
+      `${maxProbe.toString()} nonces (client-side cost limit, not a protocol limit — ` +
+      `market_nonce is a u64). Retry with a larger maxProbe or a minNonce above ` +
+      `${probeEnd.toString()} to keep searching.`,
+    'validation'
+  );
 }

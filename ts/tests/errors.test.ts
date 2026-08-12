@@ -18,6 +18,7 @@ import {
   SdkError,
   isRetryableError,
   formatErrorForLogging,
+  findFailedProgramIds,
 } from '../src/errors';
 
 describe('Error Handling', () => {
@@ -208,6 +209,54 @@ describe('Error Handling', () => {
       expect(parsed?.code).toBe(CoalescefiErrorCode.CapExceeded);
     });
 
+    // Many callers stringify the RPC error into an Error message before it
+    // reaches the SDK. createMarketWithFreshNonce only retries a nonce
+    // collision when it can read MarketAlreadyExists back out of that
+    // message, so these are the exact string shapes the retry depends on.
+    describe('client-stringified transaction errors', () => {
+      const collision = { InstructionError: [0, { Custom: 4 }] }; // MarketAlreadyExists
+
+      it('parses a prefixed stringified confirmation failure message', () => {
+        const parsed = parseCoalescefiError(
+          new Error(`Transaction failed on-chain: ${JSON.stringify(collision)}`)
+        );
+        expect(parsed?.code).toBe(CoalescefiErrorCode.MarketAlreadyExists);
+      });
+
+      it('parses an unprefixed stringified confirmation failure message', () => {
+        const parsed = parseCoalescefiError(
+          new Error(`Transaction failed: ${JSON.stringify(collision)}`)
+        );
+        expect(parsed?.code).toBe(CoalescefiErrorCode.MarketAlreadyExists);
+      });
+
+      it('parses a decoded simulation failure message', () => {
+        // A caller may throw `Transaction would fail: ${simError}` where
+        // simError has already been decoded to a friendly name/message.
+        const decoded = parseCoalescefiError(collision);
+        expect(decoded).not.toBeNull();
+        const parsed = parseCoalescefiError(
+          new Error(
+            `Transaction would fail: Program error: ${decoded!.codeName} — ${decoded!.message}`
+          )
+        );
+        expect(parsed?.code).toBe(CoalescefiErrorCode.MarketAlreadyExists);
+      });
+
+      it('reads a stringified two-digit code as decimal, not hex', () => {
+        const parsed = parseCoalescefiError(
+          new Error(
+            `Transaction failed: ${JSON.stringify({ InstructionError: [0, { Custom: 25 }] })}`
+          )
+        );
+        expect(parsed?.code).toBe(CoalescefiErrorCode.CapExceeded); // 25, not 0x25
+      });
+
+      it('ignores a decoded name that is not a known error code', () => {
+        expect(parseCoalescefiError(new Error('Program error: SomethingElse'))).toBeNull();
+      });
+    });
+
     it('should handle nested err field', () => {
       const mockError = {
         err: {
@@ -275,6 +324,263 @@ describe('Error Handling', () => {
       const parsed = parseCoalescefiError(outerError);
       expect(parsed).not.toBeNull();
       expect(parsed?.code).toBe(CoalescefiErrorCode.NotMatured);
+    });
+
+    describe('wallet connector wrappers', () => {
+      /**
+       * Mirrors `@solana/connector@0.2.4`, a wallet-connector stack apps
+       * commonly sign and send through.
+       *
+       * Faithful to node_modules/@solana/connector/dist/chunk-SJCQ3KZE.mjs:141
+       * (`ConnectorError`) and :187 (`TransactionError`): the base constructor
+       * calls `super(message)` and assigns the wrapped error to `originalError`.
+       * It never populates the standard `cause`, and the message it wraps with
+       * is a fixed literal that carries no program error code.
+       */
+      class ConnectorTransactionError extends Error {
+        readonly code: string;
+        readonly recoverable: boolean;
+        readonly context?: Record<string, unknown>;
+        readonly originalError?: Error;
+        readonly timestamp: string;
+
+        constructor(
+          code: string,
+          message: string,
+          context?: Record<string, unknown>,
+          originalError?: Error
+        ) {
+          super(message);
+          this.name = this.constructor.name;
+          this.code = code;
+          this.recoverable = ['USER_REJECTED', 'SEND_FAILED', 'SIMULATION_FAILED'].includes(code);
+          this.context = context;
+          this.originalError = originalError;
+          this.timestamp = new Date().toISOString();
+        }
+      }
+
+      /** Exactly the throw at chunk-KE3IEBN2.mjs:2983. */
+      function wrapAsSendFailed(rpcError: Error): ConnectorTransactionError {
+        return new ConnectorTransactionError(
+          'SEND_FAILED',
+          'Failed to send transaction',
+          undefined,
+          rpcError
+        );
+      }
+
+      it('recovers the code from a connector SEND_FAILED wrapping a preflight failure', () => {
+        // Wallet preflight rejects the occupied nonce with MarketAlreadyExists (4).
+        const rpcError = new Error(
+          'Transaction simulation failed: Error processing Instruction 0: custom program error: 0x4'
+        );
+        const wrapped = wrapAsSendFailed(rpcError);
+
+        // The wrapper itself carries no code: message is a fixed literal and
+        // `cause` is never set. Only `originalError` holds the real failure.
+        expect(wrapped.message).toBe('Failed to send transaction');
+        expect(wrapped.cause).toBeUndefined();
+
+        expect(parseCoalescefiError(wrapped)?.code).toBe(CoalescefiErrorCode.MarketAlreadyExists);
+      });
+
+      it('recovers the code from a connector wrapper around a logs-bearing RPC error', () => {
+        const rpcError = Object.assign(new Error('Simulation failed'), {
+          logs: [
+            'Program GooseA4bSoxitTMPa4ppe2zUQ9fu4139u8pEk6x65SR invoke [1]',
+            'Program GooseA4bSoxitTMPa4ppe2zUQ9fu4139u8pEk6x65SR failed: custom program error: 0x4',
+          ],
+        });
+
+        expect(parseCoalescefiError(wrapAsSendFailed(rpcError))?.code).toBe(
+          CoalescefiErrorCode.MarketAlreadyExists
+        );
+      });
+
+      it('recovers the code through a doubly-wrapped connector error', () => {
+        // signAndSendTransactions (chunk-KE3IEBN2.mjs:2998) wraps the error that
+        // signAndSendTransaction (:2983) already wrapped.
+        const inner = wrapAsSendFailed(new Error('custom program error: 0x4'));
+        const outer = new ConnectorTransactionError(
+          'SEND_FAILED',
+          'Failed to send transaction 1 of 1',
+          { index: 0, total: 1 },
+          inner
+        );
+
+        expect(parseCoalescefiError(outer)?.code).toBe(CoalescefiErrorCode.MarketAlreadyExists);
+      });
+
+      it('still returns null when the wrapped error is not a program error', () => {
+        expect(
+          parseCoalescefiError(wrapAsSendFailed(new Error('Network request failed')))
+        ).toBeNull();
+      });
+
+      // ─── Traversal guards ─────────────────────────────────────
+      //
+      // Two separate jobs, deliberately tested separately: the cycle guard stops
+      // a wrapper that points back along its own path, and the node budget stops
+      // an acyclic graph that is merely enormous. Each test below is built so
+      // that removing ITS guard alone breaks it — a cycle test that only proves
+      // "the traversal terminated" would pass with the cycle guard deleted,
+      // because the budget terminates it either way.
+      //
+      // The lever is strategy precedence: `err` (strategy 3) is followed before
+      // `originalError` (strategy 7). Putting the cycle on `err` and the code on
+      // `originalError` means an unguarded cycle burns the whole node budget
+      // first, and the code that comes after it is never reached.
+      it('finds a code past a self-referential cycle in an earlier-checked property', () => {
+        const selfRef = new Error('Failed to send transaction') as Error & {
+          err?: unknown;
+          originalError?: unknown;
+        };
+        selfRef.err = selfRef;
+        selfRef.originalError = { InstructionError: [0, { Custom: 4 }] };
+
+        expect(parseCoalescefiError(selfRef)?.code).toBe(CoalescefiErrorCode.MarketAlreadyExists);
+      });
+
+      it('finds a code past a mutual cycle between two wrappers', () => {
+        const a = new Error('Failed to send transaction') as Error & {
+          err?: unknown;
+          originalError?: unknown;
+        };
+        const b = new Error('Failed to send transaction') as Error & { err?: unknown };
+        a.err = b;
+        b.err = a;
+        a.originalError = { InstructionError: [0, { Custom: 4 }] };
+
+        expect(parseCoalescefiError(a)?.code).toBe(CoalescefiErrorCode.MarketAlreadyExists);
+      });
+
+      it('parses a legitimately deep wrapper chain', () => {
+        // 40 nested wrappers with the real failure at the bottom. Nothing about
+        // this shape is pathological — a wallet is free to wrap this much — so
+        // the traversal must reach the code rather than give up part way.
+        let chain: Error & { originalError?: unknown } = new Error('custom program error: 0x4');
+        for (let i = 0; i < 40; i++) {
+          const outer = new Error('Failed to send transaction') as Error & {
+            originalError?: unknown;
+          };
+          outer.originalError = chain;
+          chain = outer;
+        }
+
+        expect(parseCoalescefiError(chain)?.code).toBe(CoalescefiErrorCode.MarketAlreadyExists);
+      });
+
+      // Budget boundary. The traversal may examine 512 error objects; a chain of
+      // N wrappers costs exactly N visits, so the code survives at 512 links and
+      // is out of reach at 513.
+      function chainOfLength(length: number): Error {
+        let chain: Error & { originalError?: unknown } = new Error('custom program error: 0x4');
+        for (let i = 1; i < length; i++) {
+          const outer = new Error('Failed to send transaction') as Error & {
+            originalError?: unknown;
+          };
+          outer.originalError = chain;
+          chain = outer;
+        }
+        return chain;
+      }
+
+      it('parses a chain exactly at the node budget', () => {
+        expect(parseCoalescefiError(chainOfLength(512))?.code).toBe(
+          CoalescefiErrorCode.MarketAlreadyExists
+        );
+      });
+
+      it('gives up on a chain one node past the budget', () => {
+        expect(parseCoalescefiError(chainOfLength(513))).toBeNull();
+      });
+
+      it('bails out of an acyclic chain that is absurdly deep', () => {
+        // Distinct objects, so the cycle guard never trips — only the node
+        // budget stops this. 100_000 links would overflow the stack unguarded.
+        expect(parseCoalescefiError(chainOfLength(100_000))).toBeNull();
+      });
+
+      it('recovers a code past a wrapper graph whose paths multiply', () => {
+        // Eight wrappers, each pointing at the same child through BOTH `err`
+        // and `error`: 11 objects in total, no cycle, nothing deeper than 10
+        // links — but 2^8 distinct root-to-leaf paths through it.
+        //
+        // Charging the work budget per VISIT rather than per distinct object
+        // makes the traversal re-expand that shared subtree once per path and
+        // spend all 512 units on it, so the code sitting one hop off the root
+        // is never reached. Charging per object costs 11.
+        const leaf = { message: 'nothing parseable here' };
+        let shared: object = leaf;
+        for (let i = 0; i < 8; i++) {
+          shared = { err: shared, error: shared };
+        }
+        const root = {
+          err: shared,
+          error: shared,
+          originalError: { InstructionError: [0, { Custom: 4 }] },
+        };
+
+        expect(parseCoalescefiError(root)?.code).toBe(CoalescefiErrorCode.MarketAlreadyExists);
+      });
+
+      it('reuses, rather than re-walks, an object reachable by several paths', () => {
+        // Direct observation of the property the test above depends on: a
+        // getter that counts reads. Ten sibling wrappers all point at the same
+        // child, so a traversal that expands per path reads the child's
+        // properties ten times. Expanding per object reads them once.
+        let reads = 0;
+        const child = {} as { err: unknown };
+        Object.defineProperty(child, 'err', {
+          enumerable: true,
+          get() {
+            reads += 1;
+            return null;
+          },
+        });
+        let siblings: object = { err: child };
+        for (let i = 0; i < 9; i++) {
+          siblings = { err: child, error: siblings };
+        }
+        const root = {
+          err: siblings,
+          originalError: { InstructionError: [0, { Custom: 4 }] },
+        };
+
+        expect(parseCoalescefiError(root)?.code).toBe(CoalescefiErrorCode.MarketAlreadyExists);
+        expect(reads).toBe(1);
+      });
+    });
+  });
+
+  describe('findFailedProgramIds', () => {
+    const programA = 'GooseA4bSoxitTMPa4ppe2zUQ9fu4139u8pEk6x65SR';
+    const programB = '2xuc7ZLcVMWkVwVoVPkmeS6n3Picycyek4wqVVy2QbGy';
+
+    it('names the program the runtime blamed, through a connector wrapper', () => {
+      const error = {
+        originalError: {
+          logs: [
+            `Program ${programB} invoke [1]`,
+            `Program ${programB} success`,
+            `Program ${programA} invoke [1]`,
+            `Program ${programA} failed: custom program error: 0x4`,
+          ],
+        },
+      };
+
+      expect(findFailedProgramIds(error)).toEqual([programA]);
+    });
+
+    it('reports nothing when no log line records a failure', () => {
+      // `invoke`/`success` lines name programs but attribute no failure, and a
+      // stringified error carries no logs at all. Both must come back empty so
+      // callers can tell "attributed elsewhere" from "not attributable".
+      expect(
+        findFailedProgramIds({ logs: [`Program ${programA} invoke [1]`, 'Program log: Deposit'] })
+      ).toEqual([]);
+      expect(findFailedProgramIds(new Error('Transaction failed: {"Custom":4}'))).toEqual([]);
     });
   });
 
