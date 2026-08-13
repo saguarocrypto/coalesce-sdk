@@ -37,6 +37,13 @@ export interface WithdrawExcessOverrides {
 
 export interface CollectFeesOverrides {
   feeTokenAccount?: PublicKey;
+  /**
+   * Who funds rent for the self-healing create-ATA instruction when the fee
+   * authority's canonical ATA does not exist yet. Defaults to the fee
+   * authority itself, which fails when the authority (e.g. a 0-SOL Squads
+   * vault) cannot pay rent. Must be a signer of the transaction.
+   */
+  ataRentPayer?: PublicKey;
 }
 
 export interface ClientCreateMarketArgs {

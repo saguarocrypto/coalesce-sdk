@@ -69,6 +69,9 @@ export * from './errors';
 export * from './constants';
 export * from './math';
 export { CoalesceClient } from './client';
+// Self-healing create-ATA builder used by the client's token-receiving flows,
+// exported for callers assembling their own transaction pipelines.
+export { buildRecipientAtaIxs } from './client/resolve';
 export type {
   ClientOptions,
   ClientCreateMarketArgs,

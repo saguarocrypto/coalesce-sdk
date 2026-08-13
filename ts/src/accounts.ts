@@ -499,6 +499,14 @@ export function decodeAccount(
 const NONCE_PROBE_BATCH_SIZE = 16;
 
 /**
+ * Hard ceiling on `batchSize`: `getMultipleAccountsInfo` rejects requests for
+ * more than 100 accounts, so a larger batch fails deterministically on every
+ * attempt — a validation error, not the retryable network error the RPC
+ * failure path would otherwise report it as.
+ */
+const RPC_MAX_MULTIPLE_ACCOUNTS = 100;
+
+/**
  * Default width of the probe window, counting up from the floor.
  *
  * A cost bound on the probe, not a limit on how many markets a borrower may
@@ -519,7 +527,10 @@ const NONCE_SPACE_END = 1n << 64n;
  * Options for {@link findNextMarketNonce}.
  */
 export interface FindNextMarketNonceOptions {
-  /** Nonces probed per getMultipleAccountsInfo call (default: 16) */
+  /**
+   * Nonces probed per getMultipleAccountsInfo call (default: 16).
+   * Must be an integer in [1, 100] — the RPC rejects larger account batches.
+   */
   batchSize?: number;
   /**
    * How many nonces to probe before throwing (default: 256).
@@ -595,21 +606,30 @@ export async function findNextMarketNonce(
   programId?: PublicKey,
   options?: FindNextMarketNonceOptions
 ): Promise<bigint> {
-  const batchSize = BigInt(options?.batchSize ?? NONCE_PROBE_BATCH_SIZE);
+  const rawBatchSize = options?.batchSize ?? NONCE_PROBE_BATCH_SIZE;
   const maxProbe = options?.maxProbe ?? NONCE_PROBE_MAX;
   const minNonce = options?.minNonce ?? 0n;
   const resolvedProgramId = programId ?? getProgramId();
 
-  if (batchSize <= 0n) {
+  // Validate BEFORE BigInt conversion: BigInt(1.5) throws a raw RangeError,
+  // which would leak an unclassified error from a function documented to throw
+  // only SdkError('network' | 'validation').
+  if (
+    !Number.isInteger(rawBatchSize) ||
+    rawBatchSize <= 0 ||
+    rawBatchSize > RPC_MAX_MULTIPLE_ACCOUNTS
+  ) {
     throw new SdkError(
-      `Invalid batchSize: ${batchSize.toString()}. Must be greater than 0.`,
+      `Invalid batchSize: ${String(rawBatchSize)}. Must be an integer between 1 and ` +
+        `${RPC_MAX_MULTIPLE_ACCOUNTS} (getMultipleAccountsInfo rejects larger batches).`,
       'validation'
     );
   }
+  const batchSize = BigInt(rawBatchSize);
 
-  if (minNonce < 0n) {
+  if (minNonce < 0n || minNonce >= NONCE_SPACE_END) {
     throw new SdkError(
-      `Invalid minNonce: ${minNonce.toString()}. Must not be negative.`,
+      `Invalid minNonce: ${minNonce.toString()}. Must be within the u64 nonce space [0, 2^64).`,
       'validation'
     );
   }
@@ -670,12 +690,17 @@ export async function findNextMarketNonce(
   // Name the bound that stopped the search and how to move it. The probe
   // window is a client-side cost limit, not a protocol limit — `market_nonce`
   // is a u64 — so a bare "no free nonce" would read as a permanent wall.
+  // EXCEPT when the window was clamped at the end of the u64 space: advising a
+  // higher minNonce there would only reproduce this same error.
+  const advice =
+    probeEnd < NONCE_SPACE_END
+      ? `Retry with a larger maxProbe or a minNonce above ${probeEnd.toString()} to keep searching.`
+      : `The probe reached the end of the u64 nonce space; no further slots exist.`;
   throw new SdkError(
     `No free market nonce found in [${minNonce.toString()}, ${probeEnd.toString()}) ` +
       `for borrower ${borrower.toBase58()}. The probe stops after maxProbe=` +
       `${maxProbe.toString()} nonces (client-side cost limit, not a protocol limit — ` +
-      `market_nonce is a u64). Retry with a larger maxProbe or a minNonce above ` +
-      `${probeEnd.toString()} to keep searching.`,
+      `market_nonce is a u64). ${advice}`,
     'validation'
   );
 }

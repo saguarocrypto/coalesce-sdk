@@ -729,6 +729,68 @@ describe('findNextMarketNonce', () => {
     ).rejects.toThrow(/batchSize/i);
   }, 1000);
 
+  it('rejects batchSize above the getMultipleAccountsInfo limit as validation, not network', async () => {
+    // The RPC caps getMultipleAccountsInfo at 100 accounts, so a larger batch
+    // fails deterministically on every attempt. It must be classified as a
+    // validation error BEFORE any RPC call — not wrapped as a retryable
+    // "please try again" network error by the RPC failure path.
+    const { connection, getMultipleAccountsInfo } = createProbeConnection(new Set());
+
+    await expect(
+      findNextMarketNonce(connection, borrower, programId, { batchSize: 128 })
+    ).rejects.toMatchObject({ type: 'validation' });
+    expect(getMultipleAccountsInfo).not.toHaveBeenCalled();
+  });
+
+  it('rejects fractional and NaN batchSize as SdkError instead of leaking a RangeError', async () => {
+    // BigInt(1.5) throws a raw RangeError; the documented contract is
+    // SdkError('network' | 'validation') only.
+    const { connection } = createProbeConnection(new Set());
+
+    await expect(
+      findNextMarketNonce(connection, borrower, programId, { batchSize: 1.5 })
+    ).rejects.toMatchObject({ type: 'validation' });
+    await expect(
+      findNextMarketNonce(connection, borrower, programId, { batchSize: Number.NaN })
+    ).rejects.toMatchObject({ type: 'validation' });
+  });
+
+  it('rejects a minNonce at or past the end of the u64 nonce space', async () => {
+    // minNonce = 2^64 passes a bare negative-check, runs zero loop iterations,
+    // and would previously rethrow the exhaustion error with the degenerate
+    // range [2^64, 2^64) — including when a caller follows the exhaustion
+    // error's own "raise minNonce" advice at the top of the space.
+    const { connection } = createProbeConnection(new Set());
+
+    await expect(
+      findNextMarketNonce(connection, borrower, programId, { minNonce: 1n << 64n })
+    ).rejects.toMatchObject({ type: 'validation' });
+    await expect(
+      findNextMarketNonce(connection, borrower, programId, { minNonce: 1n << 64n })
+    ).rejects.toThrow(/minNonce/i);
+  });
+
+  it('does not advise raising minNonce when the probe window is clamped at the end of the u64 space', async () => {
+    // Occupy the last two slots of the nonce space; the window clamps at 2^64,
+    // so "retry with a minNonce above {probeEnd}" would only reproduce the
+    // same error.
+    const topFloor = (1n << 64n) - 2n;
+    const getMultipleAccountsInfo = vi
+      .fn()
+      .mockImplementation(async (keys: unknown[]) => keys.map(() => marketAccount()));
+    const connection = {
+      getMultipleAccountsInfo,
+    } as unknown as import('@solana/web3.js').Connection;
+
+    const rejection = expect(
+      findNextMarketNonce(connection, borrower, programId, { minNonce: topFloor })
+    ).rejects;
+    await rejection.toThrow(/end of the u64 nonce space/i);
+    await expect(
+      findNextMarketNonce(connection, borrower, programId, { minNonce: topFloor })
+    ).rejects.not.toThrow(/minNonce above/i);
+  });
+
   // ─── Occupancy is ownership, not existence ──────────────────
   //
   // `create_market` calls `create_account_with_minimum_balance_signed`, which

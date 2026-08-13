@@ -1,4 +1,4 @@
-import { TOKEN_PROGRAM_ID, getAssociatedTokenAddress } from '@solana/spl-token';
+import { TOKEN_PROGRAM_ID } from '@solana/spl-token';
 import {
   type Connection,
   type Keypair,
@@ -19,18 +19,13 @@ import {
   resolveLenderAccounts,
   resolveBorrowerAccounts,
   resolveSettlementAccounts,
+  resolveAta,
   buildRecipientAtaIxs,
   getSystemProgramId,
   getProgramDataPda,
 } from './client/resolve';
 import { DEFAULT_PROGRAM_IDS } from './constants';
-import {
-  SdkError,
-  withErrorHandling,
-  parseCoalescefiError,
-  findFailedProgramIds,
-  CoalescefiErrorCode,
-} from './errors';
+import { SdkError, withErrorHandling, parseCoalescefiError, CoalescefiErrorCode } from './errors';
 import {
   createInitializeProtocolInstruction,
   createSetFeeConfigInstruction,
@@ -469,14 +464,20 @@ export class CoalesceClient {
    * same nonce, and burn the single retry on an identical doomed transaction.
    *
    * `send` is a callback so each client keeps its own wallet and transaction
-   * plumbing while this orchestration stays in one place.
+   * plumbing while this orchestration stays in one place. `send` should submit
+   * ONLY the instructions it is given: bundling instructions for other
+   * programs into the same transaction means a foreign program's `Custom(4)`,
+   * surfaced as a bare stringified message with no logs, is indistinguishable
+   * from a nonce collision and burns the single retry on a failure a fresh
+   * nonce cannot fix.
    *
    * `Custom(4)` only means `MarketAlreadyExists` when THIS program raised it.
    * A caller whose `send` bundles other instructions can have the whole
    * transaction rolled back by some other program's fourth error code, and
    * retrying that burns a second wallet signature on a deterministic failure
    * that a fresh nonce cannot fix. Transaction logs name the failing program,
-   * so when they are present the code is attributed before retrying.
+   * so when they are present the code is attributed before retrying (the
+   * `programId` option of `parseCoalescefiError`).
    *
    * Attribution is one-directional on purpose: only affirmative evidence of a
    * FOREIGN program suppresses the retry. Errors that reach the SDK as a
@@ -508,13 +509,11 @@ export class CoalesceClient {
     try {
       return await buildAndSend(nonce);
     } catch (error) {
-      if (parseCoalescefiError(error)?.code !== CoalescefiErrorCode.MarketAlreadyExists) {
-        throw error;
-      }
-      // Logs present and none of them blame this program: some other program
-      // in the caller's transaction returned its own error 4. See above.
-      const failedPrograms = findFailedProgramIds(error);
-      if (failedPrograms.length > 0 && !failedPrograms.includes(this.programId.toBase58())) {
+      // The programId option applies the one-directional attribution described
+      // above: logs that blame a foreign program suppress the parse, while an
+      // unattributable error (no logs) still parses. See above.
+      const parsed = parseCoalescefiError(error, { programId: this.programId });
+      if (parsed?.code !== CoalescefiErrorCode.MarketAlreadyExists) {
         throw error;
       }
       const retryFloor = nonce + 1n;
@@ -594,8 +593,7 @@ export class CoalesceClient {
       const [borrowerWhitelist] = findBorrowerWhitelistPda(market.borrower, this.programId);
 
       const payerTokenAccount =
-        overrides?.payerTokenAccount ??
-        (await getAssociatedTokenAddress(market.mint, payer, true, TOKEN_PROGRAM_ID));
+        overrides?.payerTokenAccount ?? (await resolveAta(payer, market.mint));
 
       return createWaterfallRepayInstructions(
         {
@@ -744,11 +742,10 @@ export class CoalesceClient {
       const market = await this.cache.getMarket(this.connection, marketPda);
       const settlement = resolveSettlementAccounts(this.programId, marketPda);
 
-      // allowOwnerOffCurve=true so an off-curve fee authority (e.g. a Squads
-      // vault) derives — and self-heals — its canonical ATA instead of throwing.
+      // resolveAta allows off-curve owners, so an off-curve fee authority
+      // (e.g. a Squads vault) derives — and self-heals — its canonical ATA.
       const feeTokenAccount =
-        overrides?.feeTokenAccount ??
-        (await getAssociatedTokenAddress(market.mint, feeAuthority, true, TOKEN_PROGRAM_ID));
+        overrides?.feeTokenAccount ?? (await resolveAta(feeAuthority, market.mint));
 
       const ix = createCollectFeesInstruction(
         {
@@ -763,7 +760,12 @@ export class CoalesceClient {
         this.programId
       );
 
-      const ataIxs = await buildRecipientAtaIxs(feeAuthority, market.mint, feeTokenAccount);
+      const ataIxs = await buildRecipientAtaIxs(
+        feeAuthority,
+        market.mint,
+        feeTokenAccount,
+        overrides?.ataRentPayer
+      );
       return [...ataIxs, ix];
     }, 'collectFees');
   }

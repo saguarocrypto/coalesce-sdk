@@ -582,6 +582,88 @@ describe('Error Handling', () => {
       ).toEqual([]);
       expect(findFailedProgramIds(new Error('Transaction failed: {"Custom":4}'))).toEqual([]);
     });
+
+    it('reaches logs nested under the JSON-RPC data member', () => {
+      // A raw RPC send/simulate failure (-32002) carries { err, logs } under
+      // `data`. Skipping it strands the only attribution evidence, so the
+      // create-market retry would burn a wallet signature it could have saved.
+      const rpcError = {
+        code: -32002,
+        message: 'Transaction simulation failed: Error processing Instruction 0',
+        data: {
+          err: { InstructionError: [0, { Custom: 4 }] },
+          logs: [
+            `Program ${programB} invoke [1]`,
+            `Program ${programB} failed: custom program error: 0x4`,
+          ],
+        },
+      };
+
+      expect(findFailedProgramIds(rpcError)).toEqual([programB]);
+    });
+  });
+
+  describe('parseCoalescefiError - JSON-RPC data member', () => {
+    it('recovers the structured error nested under data', () => {
+      const rpcError = {
+        code: -32002,
+        message: 'Transaction simulation failed',
+        data: { err: { InstructionError: [0, { Custom: 4 }] } },
+      };
+
+      expect(parseCoalescefiError(rpcError)?.code).toBe(CoalescefiErrorCode.MarketAlreadyExists);
+    });
+  });
+
+  describe('parseCoalescefiError - program attribution (programId option)', () => {
+    const OWN_PROGRAM = 'GooseA4bSoxitTMPa4ppe2zUQ9fu4139u8pEk6x65SR';
+    const SYSTEM_PROGRAM = '11111111111111111111111111111111';
+
+    // The exact shape a prepended create-ATA instruction produces when the
+    // rent payer cannot fund the account: the SYSTEM program's Custom(1)
+    // ("insufficient lamports"), which collides with InvalidFeeRate (1).
+    const foreignFailure = {
+      err: { InstructionError: [0, { Custom: 1 }] },
+      logs: [
+        `Program ${SYSTEM_PROGRAM} invoke [1]`,
+        `Program ${SYSTEM_PROGRAM} failed: custom program error: 0x1`,
+      ],
+    };
+
+    it('suppresses the parse when logs blame a foreign program', () => {
+      expect(parseCoalescefiError(foreignFailure, { programId: OWN_PROGRAM })).toBeNull();
+    });
+
+    it('still misparses without attribution — the reason the option exists', () => {
+      expect(parseCoalescefiError(foreignFailure)?.code).toBe(CoalescefiErrorCode.InvalidFeeRate);
+    });
+
+    it('parses normally when logs blame the own program', () => {
+      const ownFailure = {
+        err: { InstructionError: [1, { Custom: 4 }] },
+        logs: [`Program ${OWN_PROGRAM} failed: custom program error: 0x4`],
+      };
+
+      expect(parseCoalescefiError(ownFailure, { programId: OWN_PROGRAM })?.code).toBe(
+        CoalescefiErrorCode.MarketAlreadyExists
+      );
+    });
+
+    it('parses normally when the error carries no logs (one-directional attribution)', () => {
+      // Stringified messages and bare InstructionErrors have nothing to
+      // attribute against; only affirmative foreign evidence suppresses.
+      const unattributable = new Error('Transaction failed: {"InstructionError":[0,{"Custom":4}]}');
+
+      expect(parseCoalescefiError(unattributable, { programId: OWN_PROGRAM })?.code).toBe(
+        CoalescefiErrorCode.MarketAlreadyExists
+      );
+    });
+
+    it('accepts a PublicKey-like programId', () => {
+      const pubkeyLike = { toBase58: () => OWN_PROGRAM };
+
+      expect(parseCoalescefiError(foreignFailure, { programId: pubkeyLike })).toBeNull();
+    });
   });
 
   describe('parseCoalescefiErrorWithDebug', () => {

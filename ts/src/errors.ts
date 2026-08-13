@@ -303,6 +303,28 @@ function extractErrorCodeFromLog(log: string): number | null {
 }
 
 /**
+ * Options for {@link parseCoalescefiError}.
+ */
+export interface ParseCoalescefiErrorOptions {
+  /**
+   * When provided, the parse is suppressed (returns `null`) if the error's
+   * transaction logs affirmatively blame a DIFFERENT program for the failure.
+   *
+   * A custom error code on its own says nothing about which program produced
+   * it: `Custom(1)` is `InvalidFeeRate` in this program but "insufficient
+   * lamports" from the System program — which is exactly what a prepended
+   * create-ATA instruction produces when the rent payer is broke. Without
+   * attribution that failure decodes as a bogus fee-rate error.
+   *
+   * Attribution is one-directional: only affirmative evidence of a foreign
+   * program suppresses the parse. Errors that carry no logs (stringified
+   * messages, bare `InstructionError`s) parse normally, because there is
+   * nothing to attribute against.
+   */
+  programId?: string | { toBase58(): string };
+}
+
+/**
  * Parse a program error from transaction error.
  * Handles multiple Solana runtime versions and error formats gracefully.
  * Returns null if the error is not a CoalesceFi program error.
@@ -313,11 +335,29 @@ function extractErrorCodeFromLog(log: string): number | null {
  * - TransactionError format
  * - Nested error objects
  * - Wallet-connector wrappers that nest the cause under a non-standard property
+ * - JSON-RPC error objects carrying `{ err, logs }` under `data`
+ *
+ * Pass `options.programId` wherever the parsed error will be shown to a user:
+ * transactions built by this SDK can carry more than one instruction (the
+ * self-healing create-ATA prepend), so a raw custom code is no longer
+ * guaranteed to originate from the Coalesce program.
  *
  * @param error - The error to parse (can be any type)
+ * @param options - Optional program attribution, see {@link ParseCoalescefiErrorOptions}
  * @returns CoalescefiError if parsing succeeds, null otherwise
  */
-export function parseCoalescefiError(error: unknown): CoalescefiError | null {
+export function parseCoalescefiError(
+  error: unknown,
+  options?: ParseCoalescefiErrorOptions
+): CoalescefiError | null {
+  if (options?.programId !== undefined) {
+    const ownProgramId =
+      typeof options.programId === 'string' ? options.programId : options.programId.toBase58();
+    const failedPrograms = findFailedProgramIds(error);
+    if (failedPrograms.length > 0 && !failedPrograms.includes(ownProgramId)) {
+      return null;
+    }
+  }
   return parseCoalescefiErrorNode(error, new Set<object>(), {
     remaining: MAX_ERROR_PARSE_NODES,
   });
@@ -332,8 +372,13 @@ export function parseCoalescefiError(error: unknown): CoalescefiError | null {
  * literal, so the program's custom error code is only reachable through this
  * property — without it a nonce collision surfaced through a web wallet looks
  * like a generic send failure and the create-market retry never fires.
+ *
+ * `data` is the JSON-RPC 2.0 error member: a raw RPC send/simulate failure
+ * (e.g. `-32002`) carries `{ err, logs }` there, so skipping it strands both
+ * the structured error AND the attribution logs that
+ * {@link findFailedProgramIds} needs.
  */
-const WRAPPED_ERROR_PROPERTIES = ['originalError'] as const;
+const WRAPPED_ERROR_PROPERTIES = ['originalError', 'data'] as const;
 
 /**
  * Distinct error objects one `parseCoalescefiError` call may expand.

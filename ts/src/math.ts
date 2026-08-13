@@ -347,9 +347,16 @@ export const LEGACY_MARKET_ADDRESSES: ReadonlySet<string> = new Set([
 /**
  * True if a market uses the all-in rate transform (gross rate + protocol fee on
  * top). Every market that is NOT in the frozen legacy allowlist is transformed.
+ *
+ * An unknown/missing address defaults to TRANSFORMED: the legacy set is a
+ * frozen, complete allowlist, so anything unidentified belongs to the growing
+ * majority. Defaulting the other way silently dropped the protocol fee from
+ * `borrowerTotalCostPercent` whenever a caller had bps but no address — e.g. a
+ * pre-creation preview, which is by definition a new, transformed market —
+ * understating the borrower's all-in cost with a plausible-looking number.
  */
 export function isTransformedRateModel(marketAddress: string | null | undefined): boolean {
-  if (marketAddress == null || marketAddress === '') return false;
+  if (marketAddress == null || marketAddress === '') return true;
   return !LEGACY_MARKET_ADDRESSES.has(marketAddress);
 }
 

@@ -620,6 +620,32 @@ describe('CoalesceClient', () => {
       const accountKeys = ixs[0].keys.map((k) => k.pubkey.toBase58());
       expect(accountKeys).toContain(customFeeAta.toBase58());
     });
+
+    it('funds the self-healing create-ATA from ataRentPayer when provided', async () => {
+      // First fee collection to a 0-SOL fee authority (e.g. a fresh Squads
+      // vault): the authority cannot pay ATA rent, so an operator funds it.
+      // The create-ATA instruction's first account is the funding payer; the
+      // fee authority must remain the ATA owner (third account).
+      const feeAuthority = Keypair.generate();
+      const rentPayer = Keypair.generate().publicKey;
+      const ixs = await client.collectFees(feeAuthority.publicKey, marketPda, {
+        ataRentPayer: rentPayer,
+      });
+
+      const ataIx = ixs.find((i) => i.programId.equals(ASSOCIATED_TOKEN_PROGRAM_ID));
+      expect(ataIx).toBeDefined();
+      expect(ataIx!.keys[0].pubkey.toBase58()).toBe(rentPayer.toBase58());
+      expect(ataIx!.keys[2].pubkey.toBase58()).toBe(feeAuthority.publicKey.toBase58());
+    });
+
+    it('defaults the create-ATA rent payer to the fee authority', async () => {
+      const feeAuthority = Keypair.generate();
+      const ixs = await client.collectFees(feeAuthority.publicKey, marketPda);
+
+      const ataIx = ixs.find((i) => i.programId.equals(ASSOCIATED_TOKEN_PROGRAM_ID));
+      expect(ataIx).toBeDefined();
+      expect(ataIx!.keys[0].pubkey.toBase58()).toBe(feeAuthority.publicKey.toBase58());
+    });
   });
 
   describe('withdrawExcess', () => {

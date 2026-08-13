@@ -1088,10 +1088,15 @@ describe('Math Utilities', () => {
       expect(isTransformedRateModel(LEGACY)).toBe(false);
     });
 
-    it('treats unknown/missing address as legacy (conservative)', () => {
-      expect(isTransformedRateModel(null)).toBe(false);
-      expect(isTransformedRateModel(undefined)).toBe(false);
-      expect(isTransformedRateModel('')).toBe(false);
+    it('treats unknown/missing address as transformed (fee-inclusive)', () => {
+      // The legacy set is a frozen, complete allowlist, so anything
+      // unidentified belongs to the growing transformed majority. Defaulting
+      // to legacy silently dropped the protocol fee from the borrower's
+      // displayed cost whenever a caller had bps but no address — e.g. a
+      // pre-creation preview, which is by definition a new, transformed market.
+      expect(isTransformedRateModel(null)).toBe(true);
+      expect(isTransformedRateModel(undefined)).toBe(true);
+      expect(isTransformedRateModel('')).toBe(true);
     });
   });
 
@@ -1106,6 +1111,11 @@ describe('Math Utilities', () => {
     it('uses the stored rate as the total for legacy loans (no fee added)', () => {
       // CargoBill's legacy 14% loan: borrower agreed 14% all-in → total cost is 14%.
       expect(borrowerTotalCostPercent(1400, 1000, LEGACY)).toBe(14);
+    });
+
+    it('includes the fee for an unknown/missing address instead of understating the cost', () => {
+      expect(borrowerTotalCostPercent(1818, 1000, null)).toBeCloseTo(20, 1);
+      expect(borrowerTotalCostPercent(1818, 1000, undefined)).toBeCloseTo(20, 1);
     });
   });
 

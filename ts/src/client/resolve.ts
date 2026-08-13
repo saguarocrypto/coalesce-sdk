@@ -70,7 +70,7 @@ async function resolveBlacklistCheck(
 
 // ─── ATA Resolution ─────────────────────────────────────────
 
-async function resolveAta(owner: PublicKey, mint: PublicKey): Promise<PublicKey> {
+export async function resolveAta(owner: PublicKey, mint: PublicKey): Promise<PublicKey> {
   // Allow off-curve owners (PDAs like Squads vaults) to derive ATAs correctly
   return getAssociatedTokenAddress(mint, owner, true, TOKEN_PROGRAM_ID);
 }
@@ -87,14 +87,19 @@ async function resolveAta(owner: PublicKey, mint: PublicKey): Promise<PublicKey>
  * self-healing: it creates the canonical ATA when it is missing and is a no-op
  * (no rent charged, no error) when it already exists.
  *
- * The recipient is both the ATA owner and the rent payer. Every one of these
- * flows requires the recipient to sign the instruction (the program enforces
- * `is_signer` on the borrower / lender / fee authority), so the recipient is
- * always a valid payer regardless of whether it is on- or off-curve:
+ * By default the recipient is both the ATA owner and the rent payer. Every one
+ * of these flows requires the recipient to sign the instruction (the program
+ * enforces `is_signer` on the borrower / lender / fee authority), so the
+ * recipient is always a valid payer regardless of whether it is on- or
+ * off-curve:
  *  - an EOA wallet signs and funds the transaction directly;
  *  - a PDA recipient (e.g. a Squads vault) signs and funds via the multisig's
  *    `invoke_signed` when the wrapped instructions execute.
  * `allowOwnerOffCurve` is therefore enabled so PDA recipients self-heal too.
+ *
+ * `rentPayer` overrides who funds the ATA's rent when the recipient cannot —
+ * e.g. the first fee collection to a Squads vault holding 0 SOL. The payer
+ * must sign the transaction; the recipient remains the ATA owner.
  *
  * Returns `[]` only when `tokenAccount` is a caller-supplied override that is
  * not the recipient's canonical ATA — creating the canonical ATA would be
@@ -103,15 +108,16 @@ async function resolveAta(owner: PublicKey, mint: PublicKey): Promise<PublicKey>
 export async function buildRecipientAtaIxs(
   recipient: PublicKey,
   mint: PublicKey,
-  tokenAccount: PublicKey
+  tokenAccount: PublicKey,
+  rentPayer: PublicKey = recipient
 ): Promise<TransactionInstruction[]> {
-  const canonicalAta = await getAssociatedTokenAddress(mint, recipient, true, TOKEN_PROGRAM_ID);
+  const canonicalAta = await resolveAta(recipient, mint);
   if (!tokenAccount.equals(canonicalAta)) {
     return [];
   }
   return [
     createAssociatedTokenAccountIdempotentInstruction(
-      recipient, // payer — signs via wallet (EOA) or multisig invoke_signed (PDA)
+      rentPayer, // payer — must sign: wallet (EOA) or multisig invoke_signed (PDA)
       canonicalAta,
       recipient, // owner
       mint,

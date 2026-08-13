@@ -19,8 +19,17 @@ export const BPF_LOADER_UPGRADEABLE_PROGRAM_ID = new PublicKey(
 
 /**
  * Helper to convert a u64 to little-endian bytes.
+ *
+ * Throws on out-of-range values instead of letting `setBigUint64` wrap
+ * modulo 2^64 — silent wrapping would make `findMarketPda(borrower, 2n ** 64n)`
+ * quietly derive nonce 0's PDA, targeting the borrower's FIRST market.
  */
 function u64ToLEBytes(value: bigint): Buffer {
+  if (value < 0n || value >= 1n << 64n) {
+    throw new RangeError(
+      `Value ${value.toString()} does not fit in a u64 seed (expected 0 <= value < 2^64).`
+    );
+  }
   const buffer = Buffer.alloc(8);
   // Use DataView so this works in browser bundlers whose Buffer polyfill
   // may not implement writeBigUInt64LE.
