@@ -320,6 +320,14 @@ export interface ParseCoalescefiErrorOptions {
    * program suppresses the parse. Errors that carry no logs (stringified
    * messages, bare `InstructionError`s) parse normally, because there is
    * nothing to attribute against.
+   *
+   * LIMITATION: attribution is transaction-level, not frame-level. When the
+   * Coalesce program's own CPI into another program fails (e.g. the Token
+   * program), the runtime blames BOTH programs, the own program's presence
+   * lets the parse proceed, and the propagated inner code still decodes
+   * against the Coalesce error table. This option protects against failures
+   * in SIBLING instructions (the prepended create-ATA), not against codes
+   * propagated through the program's own CPIs.
    */
   programId?: string | { toBase58(): string };
 }
@@ -942,18 +950,24 @@ export class SdkError extends Error {
  *
  * @param operation - The async operation to execute
  * @param context - Optional context for error messages
+ * @param parseOptions - Forwarded to {@link parseCoalescefiError}; pass
+ *   `{ programId }` when the operation sends transactions that may carry
+ *   instructions for other programs (e.g. the self-healing create-ATA
+ *   prepend), so a foreign program's custom code is not decoded as a
+ *   Coalesce error.
  * @returns The result of the operation
  * @throws CoalescefiError for program errors, SdkError for other errors
  */
 export async function withErrorHandling<T>(
   operation: () => Promise<T>,
-  context?: string
+  context?: string,
+  parseOptions?: ParseCoalescefiErrorOptions
 ): Promise<T> {
   try {
     return await operation();
   } catch (error) {
     // Try to parse as program error
-    const programError = parseCoalescefiError(error);
+    const programError = parseCoalescefiError(error, parseOptions);
     if (programError) {
       throw programError;
     }

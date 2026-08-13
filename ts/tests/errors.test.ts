@@ -664,6 +664,21 @@ describe('Error Handling', () => {
 
       expect(parseCoalescefiError(foreignFailure, { programId: pubkeyLike })).toBeNull();
     });
+
+    it('suppresses when the foreign-blaming logs live only under the JSON-RPC data member', () => {
+      // Composes the two halves of this fix: attribution must reach logs that
+      // a raw RPC error nests under `data`, not just top-level `logs`. A
+      // refactor that reads `error.logs` directly instead of walking the
+      // graph would pass every other test and still miss this shape.
+      const rpcWrapped = {
+        code: -32002,
+        message: 'Transaction simulation failed: Error processing Instruction 0',
+        data: foreignFailure,
+      };
+
+      expect(parseCoalescefiError(rpcWrapped, { programId: OWN_PROGRAM })).toBeNull();
+      expect(parseCoalescefiError(rpcWrapped)?.code).toBe(CoalescefiErrorCode.InvalidFeeRate);
+    });
   });
 
   describe('parseCoalescefiErrorWithDebug', () => {

@@ -773,8 +773,12 @@ export class CoalesceClient {
   // ─── Discovery & Reading State ──────────────────────────────
 
   getMarketAddress(borrower: PublicKey, nonce: bigint = 0n): PublicKey {
-    const [pda] = findMarketPda(borrower, nonce, this.programId);
-    return pda;
+    // wrapSync: findMarketPda throws a raw RangeError for nonces outside the
+    // u64 range; every client method's contract is SdkError/CoalescefiError.
+    return this.wrapSync(() => {
+      const [pda] = findMarketPda(borrower, nonce, this.programId);
+      return pda;
+    }, 'getMarketAddress');
   }
 
   async getMarket(marketPda: PublicKey): Promise<Market | null> {
@@ -845,9 +849,13 @@ export class CoalesceClient {
     }
 
     const tx = new Transaction().add(...instructions);
+    // programId: the instruction list may carry a prepended create-ATA ix, so
+    // a custom error code in the result is only decoded as a Coalesce error
+    // when the logs do not blame another program.
     return withErrorHandling(
       () => sendAndConfirmTransaction(this.connection, tx, signers),
-      'Transaction failed'
+      'Transaction failed',
+      { programId: this.programId }
     );
   }
 

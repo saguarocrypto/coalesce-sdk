@@ -1266,6 +1266,69 @@ describe('CoalesceClient.createMarketWithFreshNonce', () => {
       expect(send).toHaveBeenCalledTimes(2);
       expect('logs' in marketAlreadyExists).toBe(false);
     });
+
+    it('does not retry when foreign-blaming logs live only under the JSON-RPC data member', async () => {
+      // Raw RPC -32002 shape: { err, logs } nested under `data`. The retry
+      // must reach that attribution evidence — reading only top-level `logs`
+      // would treat this as unattributable and burn a wallet signature.
+      const client = makeClient();
+      const probe = vi.spyOn(client, 'findNextMarketNonce').mockResolvedValueOnce(4n);
+      vi.spyOn(client, 'createMarket').mockResolvedValue({
+        instructions: [],
+        marketPda: Keypair.generate().publicKey,
+      });
+      const rpcForeign = {
+        code: -32002,
+        message: 'Transaction simulation failed: Error processing Instruction 0',
+        data: {
+          err: { InstructionError: [0, { Custom: 4 }] },
+          logs: [
+            `Program ${foreignProgram.toBase58()} invoke [1]`,
+            `Program ${foreignProgram.toBase58()} failed: custom program error: 0x4`,
+          ],
+        },
+      };
+      const send = vi.fn().mockRejectedValueOnce(rpcForeign);
+
+      await expect(
+        client.createMarketWithFreshNonce(
+          Keypair.generate().publicKey,
+          Keypair.generate().publicKey,
+          marketArgs,
+          send
+        )
+      ).rejects.toBe(rpcForeign);
+      expect(send).toHaveBeenCalledTimes(1);
+      expect(probe).toHaveBeenCalledTimes(1);
+    });
+
+    it('retries when the JSON-RPC data member blames this program', async () => {
+      const client = makeClient();
+      vi.spyOn(client, 'findNextMarketNonce').mockResolvedValueOnce(4n).mockResolvedValueOnce(5n);
+      vi.spyOn(client, 'createMarket').mockResolvedValue({
+        instructions: [],
+        marketPda: Keypair.generate().publicKey,
+      });
+      const rpcOwn = {
+        code: -32002,
+        message: 'Transaction simulation failed: Error processing Instruction 0',
+        data: {
+          err: { InstructionError: [0, { Custom: 4 }] },
+          logs: [`Program ${client.programId.toBase58()} failed: custom program error: 0x4`],
+        },
+      };
+      const send = vi.fn().mockRejectedValueOnce(rpcOwn).mockResolvedValue('sig-rpc-data');
+
+      expect(
+        await client.createMarketWithFreshNonce(
+          Keypair.generate().publicKey,
+          Keypair.generate().publicKey,
+          marketArgs,
+          send
+        )
+      ).toBe('sig-rpc-data');
+      expect(send).toHaveBeenCalledTimes(2);
+    });
   });
 
   it('does not retry errors other than MarketAlreadyExists', async () => {

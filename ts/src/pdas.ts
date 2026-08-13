@@ -63,6 +63,10 @@ export function findProtocolConfigPda(programId?: PublicKey): [PublicKey, number
 /**
  * Find a Market PDA.
  * Seeds: [SEED_MARKET, borrower_pubkey, market_nonce (u64 LE)]
+ *
+ * @throws RangeError if `marketNonce` is outside the u64 range [0, 2^64) —
+ *   silently wrapping would derive a DIFFERENT market's address. Applies to
+ *   `deriveMarketPdas` too, which derives through this function.
  */
 export function findMarketPda(
   borrower: PublicKey,
