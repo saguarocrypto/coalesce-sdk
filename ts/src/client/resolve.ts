@@ -1,4 +1,8 @@
-import { getAssociatedTokenAddress, TOKEN_PROGRAM_ID } from '@solana/spl-token';
+import {
+  createAssociatedTokenAccountIdempotentInstruction,
+  getAssociatedTokenAddress,
+  TOKEN_PROGRAM_ID,
+} from '@solana/spl-token';
 import { PublicKey } from '@solana/web3.js';
 
 import {
@@ -14,7 +18,7 @@ import {
 import { configFieldToPublicKey } from '../types';
 
 import type { ProtocolCache } from './cache';
-import type { Connection } from '@solana/web3.js';
+import type { Connection, TransactionInstruction } from '@solana/web3.js';
 
 /** System program ID constant. */
 const SYSTEM_PROGRAM_ID = new PublicKey('11111111111111111111111111111111');
@@ -66,9 +70,60 @@ async function resolveBlacklistCheck(
 
 // ─── ATA Resolution ─────────────────────────────────────────
 
-async function resolveAta(owner: PublicKey, mint: PublicKey): Promise<PublicKey> {
+export async function resolveAta(owner: PublicKey, mint: PublicKey): Promise<PublicKey> {
   // Allow off-curve owners (PDAs like Squads vaults) to derive ATAs correctly
   return getAssociatedTokenAddress(mint, owner, true, TOKEN_PROGRAM_ID);
+}
+
+/**
+ * Build the instruction(s) that guarantee a token-transfer recipient's
+ * associated token account (ATA) exists before the transfer runs.
+ *
+ * The Coalesce program transfers SPL tokens to user-owned token accounts in
+ * `borrow`, `withdraw`, `claimHaircut`, `withdrawExcess`, and `collectFees`. If
+ * the destination ATA does not exist the program rejects the transfer with
+ * `InvalidAccountOwner` — a zero-lamport, System-owned address is not owned by
+ * the token program. Prepending an *idempotent* create-ATA makes these flows
+ * self-healing: it creates the canonical ATA when it is missing and is a no-op
+ * (no rent charged, no error) when it already exists.
+ *
+ * By default the recipient is both the ATA owner and the rent payer. Every one
+ * of these flows requires the recipient to sign the instruction (the program
+ * enforces `is_signer` on the borrower / lender / fee authority), so the
+ * recipient is always a valid payer regardless of whether it is on- or
+ * off-curve:
+ *  - an EOA wallet signs and funds the transaction directly;
+ *  - a PDA recipient (e.g. a Squads vault) signs and funds via the multisig's
+ *    `invoke_signed` when the wrapped instructions execute.
+ * `allowOwnerOffCurve` is therefore enabled so PDA recipients self-heal too.
+ *
+ * `rentPayer` overrides who funds the ATA's rent when the recipient cannot —
+ * e.g. the first fee collection to a Squads vault holding 0 SOL. The payer
+ * must sign the transaction; the recipient remains the ATA owner.
+ *
+ * Returns `[]` only when `tokenAccount` is a caller-supplied override that is
+ * not the recipient's canonical ATA — creating the canonical ATA would be
+ * pointless because the transfer targets a different account.
+ */
+export async function buildRecipientAtaIxs(
+  recipient: PublicKey,
+  mint: PublicKey,
+  tokenAccount: PublicKey,
+  rentPayer: PublicKey = recipient
+): Promise<TransactionInstruction[]> {
+  const canonicalAta = await resolveAta(recipient, mint);
+  if (!tokenAccount.equals(canonicalAta)) {
+    return [];
+  }
+  return [
+    createAssociatedTokenAccountIdempotentInstruction(
+      rentPayer, // payer — must sign: wallet (EOA) or multisig invoke_signed (PDA)
+      canonicalAta,
+      recipient, // owner
+      mint,
+      TOKEN_PROGRAM_ID
+    ),
+  ];
 }
 
 // ─── Lender Account Resolution ──────────────────────────────

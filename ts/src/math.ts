@@ -279,6 +279,166 @@ export function calculateAPR(annualInterestBps: number): number {
 }
 
 /**
+ * Rate model — the single source of truth for how a market's stored
+ * `annualInterestBps` maps to the rates shown in the UI.
+ *
+ * On-chain the lender `scale_factor` grows at the FULL gross `annualInterestBps`,
+ * and the protocol fee is a separate, junior accrual charged ON TOP — it does
+ * NOT reduce the lender's realized yield. So:
+ *   - lender APR      = gross `annualInterestBps`
+ *   - protocol fee    = a percent of principal, charged on top of lender interest
+ *   - borrower all-in = lender APR + protocol fee
+ *
+ * Do NOT display `gross × (1 − fee)` as the lender APR: that understates the
+ * yield lenders actually realize and contradicts the program and legal docs.
+ */
+
+/** Lender APR as a percent number (e.g. `20` for 20%). Lenders earn the full gross rate. */
+export function lenderAprPercent(annualInterestBps: number): number {
+  return annualInterestBps / 100;
+}
+
+/** Protocol fee as a percent of principal, charged ON TOP of lender interest (junior). */
+export function protocolFeePercent(annualInterestBps: number, feeRateBps: number): number {
+  return (annualInterestBps / 100) * (feeRateBps / 10_000);
+}
+
+/** Borrower's all-in cost as a percent number: lender APR + protocol fee. */
+export function borrowerAllInPercent(annualInterestBps: number, feeRateBps: number): number {
+  return lenderAprPercent(annualInterestBps) + protocolFeePercent(annualInterestBps, feeRateBps);
+}
+
+/**
+ * All-in rate transform: the borrower's entered rate is their ALL-IN
+ * cost. The program pays lenders the stored gross rate and accrues the fee on
+ * top (borrower all-in = stored × (1 + fee_rate)), so loans created under this
+ * model store a REDUCED rate, making the borrower's all-in land exactly on what
+ * they entered: `stored = round(allInBps × BPS / (BPS + feeRateBps))`.
+ * Example: enter 20% at a 10% fee → store 18.18% → lenders earn 18.18%, fee
+ * 1.82%, borrower pays 20%.
+ */
+export function allInToStoredBps(allInBps: number, feeRateBps: number): number {
+  return Math.round((allInBps * 10_000) / (10_000 + feeRateBps));
+}
+
+/**
+ * Approximate production deploy time of the all-in rate transform — kept only
+ * as a human sanity reference. Classification is by address
+ * (LEGACY_MARKET_ADDRESSES), NOT by timestamp: the market account has no
+ * on-chain rate-model flag and off-chain creation timestamps are unreliable.
+ */
+export const RATE_MODEL_TRANSFORM_CUTOVER_ISO = '2026-06-19T00:00:00Z';
+
+/**
+ * Markets created BEFORE the all-in rate transform shipped. They stored the
+ * borrower's agreed all-in rate directly as the gross rate, so their total cost
+ * IS the stored rate (no fee added on top, no fee funded at repayment). Frozen
+ * by address — this is the complete set of pre-transform mainnet markets, and it
+ * can only ever shrink in relevance (every NEW market is transformed).
+ */
+export const LEGACY_MARKET_ADDRESSES: ReadonlySet<string> = new Set([
+  '5GVhGvMQhAAt5gdra1cvy5zP5wdtbUaQhsiFKVUXA9mu',
+  '9gHSE1soFoq1AytWpfv7roF8YMQJLvkj92BBKpVAo6C6',
+  'A9Cgj4Evmg1ycH8FnovSZ8ZZKu9mBdmBksnv3pHDj8iB',
+  'Cx9cyLRNKPWmV3cinuHAjdP9EgjR71V5J1JZCmS4yHN7',
+  'EgrTCM6Xt7EFjw7eoofcmDt5idjWrk2uFgmZUnnQYncb',
+]);
+
+/**
+ * True if a market uses the all-in rate transform (gross rate + protocol fee on
+ * top). Every market that is NOT in the frozen legacy allowlist is transformed.
+ *
+ * An unknown/missing address defaults to TRANSFORMED: the legacy set is a
+ * frozen, complete allowlist, so anything unidentified belongs to the growing
+ * majority. Defaulting the other way silently dropped the protocol fee from
+ * `borrowerTotalCostPercent` whenever a caller had bps but no address — e.g. a
+ * pre-creation preview, which is by definition a new, transformed market —
+ * understating the borrower's all-in cost with a plausible-looking number.
+ */
+export function isTransformedRateModel(marketAddress: string | null | undefined): boolean {
+  if (marketAddress == null || marketAddress === '') return true;
+  return !LEGACY_MARKET_ADDRESSES.has(marketAddress);
+}
+
+/**
+ * Borrower's displayed total cost as a percent. Transformed loans add the fee on
+ * top of the stored rate (= the entered all-in); legacy loans already stored the
+ * agreed all-in, so their total cost IS the stored rate (no fee added on top).
+ */
+export function borrowerTotalCostPercent(
+  annualInterestBps: number,
+  feeRateBps: number,
+  marketAddress: string | null | undefined
+): number {
+  return isTransformedRateModel(marketAddress)
+    ? borrowerAllInPercent(annualInterestBps, feeRateBps)
+    : lenderAprPercent(annualInterestBps);
+}
+
+/** Fields needed to compute a transformed loan's remaining all-in interest. */
+export interface RemainingInterestInput {
+  scaledTotalSupply: bigint;
+  /** Current on-chain (pre-accrual) scale factor. */
+  scaleFactor: bigint;
+  totalDeposited: bigint;
+  totalInterestRepaid: bigint;
+  lastAccrualTimestamp: bigint;
+  maturityTimestamp: bigint;
+  annualInterestBps: number;
+  /** Program's current fee accumulator (decremented by collect_fees). */
+  accruedProtocolFees: bigint;
+  /** Σ of all collect_fees amounts for this market (un-decrements the accumulator). */
+  totalCollectedFee: bigint;
+  /** > 0 once the market is settled; exact interest math no longer holds. */
+  settlementFactorWad: bigint;
+}
+
+/**
+ * Borrower's remaining ALL-IN interest (lender gross + protocol fee) for a
+ * TRANSFORMED loan, computed to match the on-chain program EXACTLY under any
+ * mid-loan SetFeeConfig change or collect_fees sweep. Returns `null` if the
+ * market is settled (interest math no longer exact).
+ *
+ * The protocol fee component mirrors the on-chain `accrue_interest` logic:
+ *   total fee ever accrued = accruedProtocolFees + totalCollectedFee
+ *     (the live-fee, historically-weighted accumulator, un-decremented), PLUS
+ *   projectedFeeDelta = the fee on interest since the last on-chain accrual, at
+ *     the live fee, which the program will book on the next accrual at repay:
+ *       base        = scaledTotalSupply * scaleFactor / WAD   (pre-accrual)
+ *       feeDeltaWad  = (totalGrowthWad - WAD) * currentFeeBps / BPS
+ *       projectedFeeDelta = base * feeDeltaWad / WAD
+ * remaining = max(0, gross + accrued + collected + projectedFeeDelta - repaid).
+ */
+export function transformedRemainingInterest(
+  input: RemainingInterestInput,
+  nowSeconds: bigint,
+  currentFeeBps: number
+): bigint | null {
+  if (input.settlementFactorWad > 0n) return null;
+  if (input.scaleFactor === 0n || input.scaledTotalSupply === 0n) return 0n;
+
+  const effectiveNow = nowSeconds > input.maturityTimestamp ? input.maturityTimestamp : nowSeconds;
+  const elapsed =
+    effectiveNow > input.lastAccrualTimestamp ? effectiveNow - input.lastAccrualTimestamp : 0n;
+  const totalGrowthWad =
+    elapsed > 0n ? growthFactorWad(BigInt(input.annualInterestBps), elapsed) : WAD;
+
+  const projectedScaleFactor = mulWad(input.scaleFactor, totalGrowthWad);
+  const normalizedNow = (input.scaledTotalSupply * projectedScaleFactor) / WAD;
+  const gross = normalizedNow > input.totalDeposited ? normalizedNow - input.totalDeposited : 0n;
+
+  // projectedFeeDelta mirrors the on-chain floored operation order exactly.
+  const base = (input.scaledTotalSupply * input.scaleFactor) / WAD;
+  const interestDeltaWad = totalGrowthWad > WAD ? totalGrowthWad - WAD : 0n;
+  const feeDeltaWad = (interestDeltaWad * BigInt(currentFeeBps)) / BPS;
+  const projectedFeeDelta = (base * feeDeltaWad) / WAD;
+
+  const totalFee = input.accruedProtocolFees + input.totalCollectedFee + projectedFeeDelta;
+  const owed = gross + totalFee - input.totalInterestRepaid;
+  return owed > 0n ? owed : 0n;
+}
+
+/**
  * Calculate the estimated value at maturity for a position.
  */
 export function estimateValueAtMaturity(
@@ -408,17 +568,11 @@ export function calculateUtilizationRateDecimal(market: Market): number {
   return calculateUtilizationRate(market).decimal;
 }
 
-/**
- * Calculate the net APR after protocol fees.
- * netAprBps = annualInterestBps * (10000 - protocolFeeBps) / 10000
- *
- * @param grossAprBps - Annual interest rate in basis points (e.g., 800 = 8%)
- * @param protocolFeeBps - Protocol fee in basis points (e.g., 1000 = 10% of interest)
- * @returns Net APR in basis points after fees
- */
-export function calculateNetAPR(grossAprBps: number, protocolFeeBps: number): number {
-  return Math.floor((grossAprBps * (10000 - protocolFeeBps)) / 10000);
-}
+// NOTE: There is intentionally no "net APR after fees" helper. On-chain, the
+// lender scale factor grows at the full gross rate (see the program interest
+// model) and the protocol fee is a separate, junior accrual — lenders realize
+// the gross APR. A `gross * (1 - fee)` figure does not represent lender yield
+// and must not be displayed as the lender's APR.
 
 /**
  * Calculate the TVL (Total Value Locked) for a market.

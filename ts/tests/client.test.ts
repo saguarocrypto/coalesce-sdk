@@ -1,4 +1,10 @@
+import {
+  ASSOCIATED_TOKEN_PROGRAM_ID,
+  TOKEN_PROGRAM_ID,
+  getAssociatedTokenAddress,
+} from '@solana/spl-token';
 import { Keypair, PublicKey } from '@solana/web3.js';
+import type { Connection, TransactionInstruction } from '@solana/web3.js';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 
 import { CoalesceClient } from '../src/client';
@@ -89,6 +95,21 @@ function createMockConnection(accountDataMap: Map<string, Uint8Array>): unknown 
       return { data: Buffer.from(data), executable: false, lamports: 1, owner: TEST_PROGRAM_ID };
     }),
   };
+}
+
+/** Locate the Coalesce program instruction with the given discriminator (skips any prepended create-ATA ix). */
+function findCoalesceIx(
+  ixs: TransactionInstruction[],
+  discriminator: number
+): TransactionInstruction {
+  const ix = ixs.find((i) => i.programId.equals(TEST_PROGRAM_ID) && i.data[0] === discriminator);
+  if (!ix) throw new Error(`No Coalesce ix with discriminator ${discriminator}`);
+  return ix;
+}
+
+/** True when the instruction set begins with an idempotent create-ATA instruction. */
+function hasCreateAtaIx(ixs: TransactionInstruction[]): boolean {
+  return ixs.some((i) => i.programId.equals(ASSOCIATED_TOKEN_PROGRAM_ID));
 }
 
 // ─── Tests ──────────────────────────────────────────────────
@@ -189,24 +210,27 @@ describe('CoalesceClient', () => {
   describe('withdraw', () => {
     it('should return instructions with correct discriminator', async () => {
       const ixs = await client.withdraw(lender.publicKey, marketPda, 500_000n);
-      expect(ixs).toHaveLength(1);
-      expect(ixs[0].data[0]).toBe(InstructionDiscriminator.Withdraw);
+      // create-ATA (idempotent) + withdraw
+      expect(ixs).toHaveLength(2);
+      expect(findCoalesceIx(ixs, InstructionDiscriminator.Withdraw)).toBeDefined();
     });
   });
 
   describe('withdrawAndClose', () => {
-    it('should return 2 instructions: withdraw + close', async () => {
+    it('should return 3 instructions: create-ATA + withdraw + close', async () => {
       const ixs = await client.withdrawAndClose(lender.publicKey, marketPda);
-      expect(ixs).toHaveLength(2);
-      expect(ixs[0].data[0]).toBe(InstructionDiscriminator.Withdraw);
-      expect(ixs[1].data[0]).toBe(InstructionDiscriminator.CloseLenderPosition);
+      expect(ixs).toHaveLength(3);
+      expect(hasCreateAtaIx(ixs)).toBe(true);
+      expect(findCoalesceIx(ixs, InstructionDiscriminator.Withdraw)).toBeDefined();
+      expect(findCoalesceIx(ixs, InstructionDiscriminator.CloseLenderPosition)).toBeDefined();
     });
 
     it('should pass scaledAmount=0 for full withdrawal', async () => {
       const ixs = await client.withdrawAndClose(lender.publicKey, marketPda);
+      const withdrawIx = findCoalesceIx(ixs, InstructionDiscriminator.Withdraw);
       // Withdraw data: [discriminator(1), scaledAmount(16), minPayout(8)]
       // scaledAmount is u128 LE at bytes 1-16, should be all zeros
-      const scaledAmountBytes = ixs[0].data.subarray(1, 17);
+      const scaledAmountBytes = withdrawIx.data.subarray(1, 17);
       expect(scaledAmountBytes.every((b) => b === 0)).toBe(true);
     });
   });
@@ -232,10 +256,15 @@ describe('CoalesceClient', () => {
       seedPosition(LENDER_SCALED_BALANCE);
       // floor(1_000_000 * 1e18 / 1_027_772_191_401_129_296) = 972_978 scaled shares.
       const ixs = await client.withdrawByUsdc(lender.publicKey, marketPda, 1_000_000n);
-      expect(ixs).toHaveLength(1);
-      expect(ixs[0].data[0]).toBe(InstructionDiscriminator.Withdraw);
+      // create-ATA (idempotent) + withdraw
+      expect(ixs).toHaveLength(2);
+      const withdrawIx = findCoalesceIx(ixs, InstructionDiscriminator.Withdraw);
       // scaled_amount at bytes 1..17 (u128 LE)
-      const view = new DataView(ixs[0].data.buffer, ixs[0].data.byteOffset, ixs[0].data.byteLength);
+      const view = new DataView(
+        withdrawIx.data.buffer,
+        withdrawIx.data.byteOffset,
+        withdrawIx.data.byteLength
+      );
       const scaled = view.getBigUint64(1, true) | (view.getBigUint64(9, true) << 64n);
       expect(scaled).toBe(972_978n);
     });
@@ -245,7 +274,12 @@ describe('CoalesceClient', () => {
       // ChRiS's mainnet case: 5.14 USDC requested but balance is 4_999_329 shares
       // (worth ~5.138 USDC). Conversion would overshoot; clamp must absorb it.
       const ixs = await client.withdrawByUsdc(lender.publicKey, marketPda, 5_140_000n);
-      const view = new DataView(ixs[0].data.buffer, ixs[0].data.byteOffset, ixs[0].data.byteLength);
+      const withdrawIx = findCoalesceIx(ixs, InstructionDiscriminator.Withdraw);
+      const view = new DataView(
+        withdrawIx.data.buffer,
+        withdrawIx.data.byteOffset,
+        withdrawIx.data.byteLength
+      );
       const scaled = view.getBigUint64(1, true) | (view.getBigUint64(9, true) << 64n);
       expect(scaled).toBe(LENDER_SCALED_BALANCE);
     });
@@ -296,8 +330,9 @@ describe('CoalesceClient', () => {
   describe('borrow', () => {
     it('should return instructions with correct discriminator', async () => {
       const ixs = await client.borrow(borrower.publicKey, marketPda, 1_000_000n);
-      expect(ixs).toHaveLength(1);
-      expect(ixs[0].data[0]).toBe(InstructionDiscriminator.Borrow);
+      // create-ATA (idempotent) + borrow
+      expect(ixs).toHaveLength(2);
+      expect(findCoalesceIx(ixs, InstructionDiscriminator.Borrow)).toBeDefined();
     });
 
     it('should use override token account when provided', async () => {
@@ -345,17 +380,19 @@ describe('CoalesceClient', () => {
   describe('claimHaircut', () => {
     it('should return instructions with correct discriminator', async () => {
       const ixs = await client.claimHaircut(lender.publicKey, marketPda);
-      expect(ixs).toHaveLength(1);
-      expect(ixs[0].data[0]).toBe(InstructionDiscriminator.ClaimHaircut);
+      // create-ATA (idempotent) + claimHaircut
+      expect(ixs).toHaveLength(2);
+      expect(findCoalesceIx(ixs, InstructionDiscriminator.ClaimHaircut)).toBeDefined();
     });
   });
 
   describe('claimHaircutAndClose', () => {
-    it('should return 2 instructions: claim + close', async () => {
+    it('should return 3 instructions: create-ATA + claim + close', async () => {
       const ixs = await client.claimHaircutAndClose(lender.publicKey, marketPda);
-      expect(ixs).toHaveLength(2);
-      expect(ixs[0].data[0]).toBe(InstructionDiscriminator.ClaimHaircut);
-      expect(ixs[1].data[0]).toBe(InstructionDiscriminator.CloseLenderPosition);
+      expect(ixs).toHaveLength(3);
+      expect(hasCreateAtaIx(ixs)).toBe(true);
+      expect(findCoalesceIx(ixs, InstructionDiscriminator.ClaimHaircut)).toBeDefined();
+      expect(findCoalesceIx(ixs, InstructionDiscriminator.CloseLenderPosition)).toBeDefined();
     });
   });
 
@@ -569,8 +606,9 @@ describe('CoalesceClient', () => {
     it('should return instructions with correct discriminator', async () => {
       const feeAuthority = Keypair.generate();
       const ixs = await client.collectFees(feeAuthority.publicKey, marketPda);
-      expect(ixs).toHaveLength(1);
-      expect(ixs[0].data[0]).toBe(InstructionDiscriminator.CollectFees);
+      // create-ATA (idempotent) + collectFees
+      expect(ixs).toHaveLength(2);
+      expect(findCoalesceIx(ixs, InstructionDiscriminator.CollectFees)).toBeDefined();
     });
 
     it('should use override feeTokenAccount when provided', async () => {
@@ -582,13 +620,40 @@ describe('CoalesceClient', () => {
       const accountKeys = ixs[0].keys.map((k) => k.pubkey.toBase58());
       expect(accountKeys).toContain(customFeeAta.toBase58());
     });
+
+    it('funds the self-healing create-ATA from ataRentPayer when provided', async () => {
+      // First fee collection to a 0-SOL fee authority (e.g. a fresh Squads
+      // vault): the authority cannot pay ATA rent, so an operator funds it.
+      // The create-ATA instruction's first account is the funding payer; the
+      // fee authority must remain the ATA owner (third account).
+      const feeAuthority = Keypair.generate();
+      const rentPayer = Keypair.generate().publicKey;
+      const ixs = await client.collectFees(feeAuthority.publicKey, marketPda, {
+        ataRentPayer: rentPayer,
+      });
+
+      const ataIx = ixs.find((i) => i.programId.equals(ASSOCIATED_TOKEN_PROGRAM_ID));
+      expect(ataIx).toBeDefined();
+      expect(ataIx!.keys[0].pubkey.toBase58()).toBe(rentPayer.toBase58());
+      expect(ataIx!.keys[2].pubkey.toBase58()).toBe(feeAuthority.publicKey.toBase58());
+    });
+
+    it('defaults the create-ATA rent payer to the fee authority', async () => {
+      const feeAuthority = Keypair.generate();
+      const ixs = await client.collectFees(feeAuthority.publicKey, marketPda);
+
+      const ataIx = ixs.find((i) => i.programId.equals(ASSOCIATED_TOKEN_PROGRAM_ID));
+      expect(ataIx).toBeDefined();
+      expect(ataIx!.keys[0].pubkey.toBase58()).toBe(feeAuthority.publicKey.toBase58());
+    });
   });
 
   describe('withdrawExcess', () => {
     it('should return instructions with correct discriminator', async () => {
       const ixs = await client.withdrawExcess(borrower.publicKey, marketPda);
-      expect(ixs).toHaveLength(1);
-      expect(ixs[0].data[0]).toBe(InstructionDiscriminator.WithdrawExcess);
+      // create-ATA (idempotent) + withdrawExcess
+      expect(ixs).toHaveLength(2);
+      expect(findCoalesceIx(ixs, InstructionDiscriminator.WithdrawExcess)).toBeDefined();
     });
 
     it('should use override borrowerTokenAccount when provided', async () => {
@@ -666,6 +731,787 @@ describe('CoalesceClient', () => {
       );
       expect(ixs).toHaveLength(1);
       expect(ixs[0].data[0]).toBe(InstructionDiscriminator.SetWhitelistManager);
+    });
+  });
+
+  // Regression: a borrow on mainnet failed with custom error 0xe
+  // (InvalidAccountOwner) because the borrower's destination USDC ATA did not
+  // exist. Token-receiving flows now prepend an idempotent create-ATA so the
+  // destination is guaranteed to exist before the transfer runs.
+  describe('recipient ATA creation (idempotent)', () => {
+    it('borrow prepends an idempotent create-ATA for an on-curve borrower', async () => {
+      const ixs = await client.borrow(borrower.publicKey, marketPda, 1_000_000n);
+      expect(ixs).toHaveLength(2);
+
+      const createIx = ixs[0];
+      expect(createIx.programId.equals(ASSOCIATED_TOKEN_PROGRAM_ID)).toBe(true);
+      // CreateIdempotent instruction discriminator
+      expect(createIx.data[0]).toBe(1);
+
+      const ata = await getAssociatedTokenAddress(
+        mint,
+        borrower.publicKey,
+        false,
+        TOKEN_PROGRAM_ID
+      );
+      const keys = createIx.keys.map((k) => k.pubkey.toBase58());
+      expect(keys).toContain(ata.toBase58());
+      expect(keys).toContain(borrower.publicKey.toBase58());
+      expect(keys).toContain(mint.toBase58());
+
+      // Payer (the borrower) must be a writable signer to fund rent.
+      const payerMeta = createIx.keys.find((k) => k.pubkey.equals(borrower.publicKey));
+      expect(payerMeta?.isSigner).toBe(true);
+      expect(payerMeta?.isWritable).toBe(true);
+
+      // The create-ATA runs BEFORE the borrow transfer.
+      expect(ixs[1].programId.equals(TEST_PROGRAM_ID)).toBe(true);
+      expect(ixs[1].data[0]).toBe(InstructionDiscriminator.Borrow);
+    });
+
+    it('creates the ATA for an off-curve recipient (e.g. a Squads vault PDA), funded by the recipient', async () => {
+      const [pdaBorrower] = PublicKey.findProgramAddressSync(
+        [Buffer.from('vault')],
+        TEST_PROGRAM_ID
+      );
+      expect(PublicKey.isOnCurve(pdaBorrower.toBytes())).toBe(false);
+
+      const ixs = await client.borrow(pdaBorrower, marketPda, 1_000_000n);
+      expect(ixs).toHaveLength(2);
+      expect(hasCreateAtaIx(ixs)).toBe(true);
+
+      // The create-ATA owns + pays via the PDA recipient. A raw transaction cannot
+      // sign for a PDA, but a multisig (e.g. Squads) supplies the signature through
+      // invoke_signed when the wrapped instructions execute.
+      const createIx = ixs[0];
+      const ata = await getAssociatedTokenAddress(mint, pdaBorrower, true, TOKEN_PROGRAM_ID);
+      const keys = createIx.keys.map((k) => k.pubkey.toBase58());
+      expect(keys).toContain(ata.toBase58());
+      expect(keys).toContain(pdaBorrower.toBase58());
+      const payerMeta = createIx.keys.find((k) => k.pubkey.equals(pdaBorrower));
+      expect(payerMeta?.isSigner).toBe(true);
+      expect(payerMeta?.isWritable).toBe(true);
+
+      expect(ixs[1].programId.equals(TEST_PROGRAM_ID)).toBe(true);
+      expect(ixs[1].data[0]).toBe(InstructionDiscriminator.Borrow);
+    });
+
+    it('does NOT create an ATA when a custom (non-canonical) token account override is supplied', async () => {
+      const customAta = Keypair.generate().publicKey;
+      const ixs = await client.borrow(borrower.publicKey, marketPda, 1_000_000n, {
+        borrowerTokenAccount: customAta,
+      });
+      expect(ixs).toHaveLength(1);
+      expect(hasCreateAtaIx(ixs)).toBe(false);
+    });
+
+    it('creates the ATA when an override equals the recipient canonical ATA', async () => {
+      const ata = await getAssociatedTokenAddress(
+        mint,
+        borrower.publicKey,
+        false,
+        TOKEN_PROGRAM_ID
+      );
+      const ixs = await client.borrow(borrower.publicKey, marketPda, 1_000_000n, {
+        borrowerTokenAccount: ata,
+      });
+      expect(ixs).toHaveLength(2);
+      expect(hasCreateAtaIx(ixs)).toBe(true);
+    });
+
+    it('prepends create-ATA for withdraw, claimHaircut, withdrawExcess, and collectFees', async () => {
+      const withdrawIxs = await client.withdraw(lender.publicKey, marketPda, 500_000n);
+      expect(hasCreateAtaIx(withdrawIxs)).toBe(true);
+
+      const claimIxs = await client.claimHaircut(lender.publicKey, marketPda);
+      expect(hasCreateAtaIx(claimIxs)).toBe(true);
+
+      const excessIxs = await client.withdrawExcess(borrower.publicKey, marketPda);
+      expect(hasCreateAtaIx(excessIxs)).toBe(true);
+
+      const feeAuthority = Keypair.generate();
+      const feeIxs = await client.collectFees(feeAuthority.publicKey, marketPda);
+      expect(hasCreateAtaIx(feeIxs)).toBe(true);
+    });
+
+    it('collectFees with an off-curve fee authority and no override derives + self-heals (no throw)', async () => {
+      const [pdaFeeAuthority] = PublicKey.findProgramAddressSync(
+        [Buffer.from('fee-vault')],
+        TEST_PROGRAM_ID
+      );
+      expect(PublicKey.isOnCurve(pdaFeeAuthority.toBytes())).toBe(false);
+
+      // Must NOT throw deriving the default fee ATA for an off-curve owner.
+      const ixs = await client.collectFees(pdaFeeAuthority, marketPda);
+      expect(ixs).toHaveLength(2);
+      expect(hasCreateAtaIx(ixs)).toBe(true);
+
+      const ata = await getAssociatedTokenAddress(mint, pdaFeeAuthority, true, TOKEN_PROGRAM_ID);
+      const keys = ixs[0].keys.map((k) => k.pubkey.toBase58());
+      expect(keys).toContain(ata.toBase58());
+      expect(keys).toContain(pdaFeeAuthority.toBase58());
+      expect(ixs[1].data[0]).toBe(InstructionDiscriminator.CollectFees);
+    });
+  });
+});
+
+describe('CoalesceClient.findNextMarketNonce', () => {
+  it('probes with the client connection and program id', async () => {
+    // programId is deliberately a fresh key, never the SDK default: the probed
+    // address is derived from it, so dropping `this.programId` on the way to
+    // `findNextMarketNonce` changes the address and fails this test.
+    const programId = Keypair.generate().publicKey;
+    const borrower = Keypair.generate().publicKey;
+    const getMultipleAccountsInfo = vi.fn().mockResolvedValue([null]);
+    const connection = { getMultipleAccountsInfo } as unknown as Connection;
+
+    const client = new CoalesceClient(connection, { programId });
+
+    expect(await client.findNextMarketNonce(borrower, { batchSize: 1 })).toBe(0n);
+    expect(getMultipleAccountsInfo).toHaveBeenCalledTimes(1);
+
+    const keys = getMultipleAccountsInfo.mock.calls[0]?.[0] as PublicKey[];
+    expect(keys.map((k) => k.toBase58())).toEqual([
+      findMarketPda(borrower, 0n, programId)[0].toBase58(),
+    ]);
+  });
+
+  it('preserves the SdkError message from a failed probe', async () => {
+    const programId = Keypair.generate().publicKey;
+    const borrower = Keypair.generate().publicKey;
+    const connection = {
+      getMultipleAccountsInfo: vi.fn().mockRejectedValue(new Error('rpc down')),
+    } as unknown as Connection;
+
+    const client = new CoalesceClient(connection, { programId });
+
+    await expect(
+      client.findNextMarketNonce(borrower, { retryConfig: { maxRetries: 0, baseDelayMs: 1 } })
+    ).rejects.toThrow("Couldn't check your existing loans — please try again.");
+  });
+});
+
+describe('CoalesceClient.createMarketWithFreshNonce', () => {
+  const marketArgs = {
+    annualInterestBps: 850,
+    maturityTimestamp: 1900000000n,
+    maxTotalSupply: 10_000_000_000n,
+  };
+
+  // Shaped like a real on-chain failure: instruction 2, custom error 4.
+  const marketAlreadyExists = Object.assign(new Error('Transaction failed'), {
+    InstructionError: [2, { Custom: 4 }],
+  });
+
+  function makeClient() {
+    const programId = Keypair.generate().publicKey;
+    const connection = {
+      getMultipleAccountsInfo: vi.fn().mockResolvedValue([null]),
+      getAccountInfo: vi.fn().mockResolvedValue(null),
+    } as unknown as Connection;
+    return new CoalesceClient(connection, { programId });
+  }
+
+  it('builds with the probed nonce and returns the signature', async () => {
+    const client = makeClient();
+    vi.spyOn(client, 'findNextMarketNonce').mockResolvedValue(7n);
+    const build = vi
+      .spyOn(client, 'createMarket')
+      .mockResolvedValue({ instructions: [], marketPda: Keypair.generate().publicKey });
+    const send = vi.fn().mockResolvedValue('sig-1');
+
+    const borrower = Keypair.generate().publicKey;
+    const mint = Keypair.generate().publicKey;
+
+    expect(await client.createMarketWithFreshNonce(borrower, mint, marketArgs, send)).toBe('sig-1');
+    expect(build).toHaveBeenCalledWith(borrower, mint, expect.objectContaining({ nonce: 7n }));
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it('re-probes and resends exactly once on MarketAlreadyExists', async () => {
+    const client = makeClient();
+    const probe = vi
+      .spyOn(client, 'findNextMarketNonce')
+      .mockResolvedValueOnce(4n)
+      .mockResolvedValueOnce(5n);
+    const build = vi
+      .spyOn(client, 'createMarket')
+      .mockResolvedValue({ instructions: [], marketPda: Keypair.generate().publicKey });
+    const send = vi.fn().mockRejectedValueOnce(marketAlreadyExists).mockResolvedValue('sig-2');
+
+    const result = await client.createMarketWithFreshNonce(
+      Keypair.generate().publicKey,
+      Keypair.generate().publicKey,
+      marketArgs,
+      send
+    );
+
+    expect(result).toBe('sig-2');
+    expect(probe).toHaveBeenCalledTimes(2);
+    expect(build).toHaveBeenNthCalledWith(
+      2,
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({ nonce: 5n })
+    );
+  });
+
+  it('gives up after a second collision', async () => {
+    const client = makeClient();
+    vi.spyOn(client, 'findNextMarketNonce').mockResolvedValue(4n);
+    vi.spyOn(client, 'createMarket').mockResolvedValue({
+      instructions: [],
+      marketPda: Keypair.generate().publicKey,
+    });
+    const send = vi.fn().mockRejectedValue(marketAlreadyExists);
+
+    await expect(
+      client.createMarketWithFreshNonce(
+        Keypair.generate().publicKey,
+        Keypair.generate().publicKey,
+        marketArgs,
+        send
+      )
+    ).rejects.toThrow();
+    expect(send).toHaveBeenCalledTimes(2);
+  });
+
+  // ─── Retry must move past the collided nonce ────────────────
+  //
+  // The collision verdict comes from whichever RPC `send` used — on web that is
+  // the wallet's, which can be further ahead than `this.connection`. A lagging
+  // re-probe would otherwise still see the collided PDA as free, hand back the
+  // same nonce, and spend the single retry on an identical doomed transaction.
+  // These tests drive the real probe (no `findNextMarketNonce` mock) against an
+  // RPC that never sees the colliding market.
+  describe('retry nonce floor', () => {
+    function makeLaggingClient(programId: PublicKey) {
+      // Every market PDA still looks free to this RPC, including the one that
+      // just collided.
+      const getMultipleAccountsInfo = vi
+        .fn()
+        .mockImplementation(async (keys: PublicKey[]) => keys.map(() => null));
+      const connection = {
+        getMultipleAccountsInfo,
+        getAccountInfo: vi.fn().mockResolvedValue(null),
+      } as unknown as Connection;
+      return { client: new CoalesceClient(connection, { programId }), getMultipleAccountsInfo };
+    }
+
+    it('does not re-select the collided nonce when the RPC still reports it free', async () => {
+      const programId = Keypair.generate().publicKey;
+      const borrower = Keypair.generate().publicKey;
+      const { client, getMultipleAccountsInfo } = makeLaggingClient(programId);
+
+      const build = vi
+        .spyOn(client, 'createMarket')
+        .mockResolvedValue({ instructions: [], marketPda: Keypair.generate().publicKey });
+      const send = vi
+        .fn()
+        .mockRejectedValueOnce(marketAlreadyExists)
+        .mockResolvedValue('sig-floor');
+
+      const result = await client.createMarketWithFreshNonce(
+        borrower,
+        Keypair.generate().publicKey,
+        marketArgs,
+        send,
+        { batchSize: 4 }
+      );
+
+      expect(result).toBe('sig-floor');
+      expect(getMultipleAccountsInfo).toHaveBeenCalledTimes(2);
+
+      // The first probe took nonce 0; the retry must build with a different one.
+      expect(build).toHaveBeenNthCalledWith(
+        1,
+        expect.anything(),
+        expect.anything(),
+        expect.objectContaining({ nonce: 0n })
+      );
+      expect(build).toHaveBeenNthCalledWith(
+        2,
+        expect.anything(),
+        expect.anything(),
+        expect.objectContaining({ nonce: 1n })
+      );
+
+      // And the second probe must not even ask about the collided PDA.
+      const secondProbeKeys = getMultipleAccountsInfo.mock.calls[1]?.[0] as PublicKey[];
+      expect(secondProbeKeys.map((k) => k.toBase58())).not.toContain(
+        findMarketPda(borrower, 0n, programId)[0].toBase58()
+      );
+    });
+
+    it('keeps a caller-supplied minNonce when it is already above the collided nonce', async () => {
+      const programId = Keypair.generate().publicKey;
+      const borrower = Keypair.generate().publicKey;
+      const { client } = makeLaggingClient(programId);
+
+      // The probe is stubbed rather than driven: it never returns below its own
+      // floor, so the only way to put the caller's floor ABOVE `collided + 1` —
+      // the case this test is named for — is to hand back a lower nonce
+      // directly. The stub stands in for any override of the probe.
+      const probe = vi
+        .spyOn(client, 'findNextMarketNonce')
+        .mockResolvedValueOnce(5n)
+        .mockResolvedValueOnce(20n);
+      const build = vi
+        .spyOn(client, 'createMarket')
+        .mockResolvedValue({ instructions: [], marketPda: Keypair.generate().publicKey });
+      const send = vi.fn().mockRejectedValueOnce(marketAlreadyExists).mockResolvedValue('sig-min');
+
+      await client.createMarketWithFreshNonce(
+        borrower,
+        Keypair.generate().publicKey,
+        marketArgs,
+        send,
+        { minNonce: 20n, batchSize: 4 }
+      );
+
+      // The retry floor from the collision would be 6n; the caller's 20n wins.
+      expect(probe).toHaveBeenNthCalledWith(
+        2,
+        borrower,
+        expect.objectContaining({ minNonce: 20n })
+      );
+      expect(build).toHaveBeenNthCalledWith(
+        1,
+        expect.anything(),
+        expect.anything(),
+        expect.objectContaining({ nonce: 5n })
+      );
+      expect(build).toHaveBeenNthCalledWith(
+        2,
+        expect.anything(),
+        expect.anything(),
+        expect.objectContaining({ nonce: 20n })
+      );
+    });
+
+    it('retries past a collision at the top of the default probe window', async () => {
+      // Nonces 0-254 are taken, so the first probe returns 255 — the last nonce
+      // of the default 256-wide window. The retry raises the floor to 256; that
+      // window has to move with the floor, not end at it.
+      const programId = Keypair.generate().publicKey;
+      const borrower = Keypair.generate().publicKey;
+      const marketAccount = { owner: programId, data: Buffer.alloc(0), lamports: 2_000_000 };
+
+      // The probe asks about nonces in ascending order starting at its floor, so
+      // a running offset maps each key in each batch back to its nonce.
+      let nextNonce = 0;
+      const getMultipleAccountsInfo = vi.fn().mockImplementation(async (keys: PublicKey[]) => {
+        const start = nextNonce;
+        nextNonce += keys.length;
+        return keys.map((_, i) => (start + i < 255 ? marketAccount : null));
+      });
+      const connection = {
+        getMultipleAccountsInfo,
+        getAccountInfo: vi.fn().mockResolvedValue(null),
+      } as unknown as Connection;
+      const client = new CoalesceClient(connection, { programId });
+
+      const build = vi
+        .spyOn(client, 'createMarket')
+        .mockResolvedValue({ instructions: [], marketPda: Keypair.generate().publicKey });
+      const send = vi.fn().mockRejectedValueOnce(marketAlreadyExists).mockResolvedValue('sig-top');
+
+      const result = await client.createMarketWithFreshNonce(
+        borrower,
+        Keypair.generate().publicKey,
+        marketArgs,
+        send
+      );
+
+      expect(result).toBe('sig-top');
+      expect(build).toHaveBeenNthCalledWith(
+        1,
+        expect.anything(),
+        expect.anything(),
+        expect.objectContaining({ nonce: 255n })
+      );
+      expect(build).toHaveBeenNthCalledWith(
+        2,
+        expect.anything(),
+        expect.anything(),
+        expect.objectContaining({ nonce: 256n })
+      );
+    }, 20_000);
+  });
+
+  // ─── Custom(4) must be attributed before it is trusted ──────
+  //
+  // `Custom(4)` is `MarketAlreadyExists` in THIS program and something else in
+  // every other one. A caller whose `send` bundles another instruction can have
+  // the transaction rolled back by that instruction's own error 4; retrying
+  // spends a second wallet signature on a failure a fresh nonce cannot fix.
+  describe('program attribution of the collision code', () => {
+    const foreignProgram = Keypair.generate().publicKey;
+
+    function collisionWithLogsFrom(programId: PublicKey) {
+      return Object.assign(new Error('Transaction failed'), {
+        InstructionError: [1, { Custom: 4 }],
+        logs: [
+          `Program ${programId.toBase58()} invoke [1]`,
+          `Program ${programId.toBase58()} failed: custom program error: 0x4`,
+        ],
+      });
+    }
+
+    it('does not retry a Custom(4) the logs blame on another program', async () => {
+      const client = makeClient();
+      const probe = vi.spyOn(client, 'findNextMarketNonce').mockResolvedValue(4n);
+      vi.spyOn(client, 'createMarket').mockResolvedValue({
+        instructions: [],
+        marketPda: Keypair.generate().publicKey,
+      });
+      const foreignError = collisionWithLogsFrom(foreignProgram);
+      const send = vi.fn().mockRejectedValue(foreignError);
+
+      await expect(
+        client.createMarketWithFreshNonce(
+          Keypair.generate().publicKey,
+          Keypair.generate().publicKey,
+          marketArgs,
+          send
+        )
+      ).rejects.toBe(foreignError);
+
+      expect(send).toHaveBeenCalledTimes(1);
+      expect(probe).toHaveBeenCalledTimes(1);
+    });
+
+    it('still retries when the logs blame this program', async () => {
+      const client = makeClient();
+      const probe = vi
+        .spyOn(client, 'findNextMarketNonce')
+        .mockResolvedValueOnce(4n)
+        .mockResolvedValueOnce(5n);
+      vi.spyOn(client, 'createMarket').mockResolvedValue({
+        instructions: [],
+        marketPda: Keypair.generate().publicKey,
+      });
+      const send = vi
+        .fn()
+        .mockRejectedValueOnce(collisionWithLogsFrom(client.programId))
+        .mockResolvedValue('sig-attributed');
+
+      expect(
+        await client.createMarketWithFreshNonce(
+          Keypair.generate().publicKey,
+          Keypair.generate().publicKey,
+          marketArgs,
+          send
+        )
+      ).toBe('sig-attributed');
+      expect(send).toHaveBeenCalledTimes(2);
+      expect(probe).toHaveBeenCalledTimes(2);
+    });
+
+    it('still retries when this program failed inside a bundle that also logs others', async () => {
+      // A bundled transaction where an earlier instruction succeeded: only the
+      // failing program is named by a `failed:` line, and it is ours.
+      const client = makeClient();
+      vi.spyOn(client, 'findNextMarketNonce').mockResolvedValueOnce(4n).mockResolvedValueOnce(5n);
+      vi.spyOn(client, 'createMarket').mockResolvedValue({
+        instructions: [],
+        marketPda: Keypair.generate().publicKey,
+      });
+      const bundled = Object.assign(new Error('Transaction failed'), {
+        logs: [
+          `Program ${foreignProgram.toBase58()} invoke [1]`,
+          `Program ${foreignProgram.toBase58()} success`,
+          `Program ${client.programId.toBase58()} invoke [2]`,
+          `Program ${client.programId.toBase58()} failed: custom program error: 0x4`,
+        ],
+      });
+      const send = vi.fn().mockRejectedValueOnce(bundled).mockResolvedValue('sig-bundled');
+
+      expect(
+        await client.createMarketWithFreshNonce(
+          Keypair.generate().publicKey,
+          Keypair.generate().publicKey,
+          marketArgs,
+          send
+        )
+      ).toBe('sig-bundled');
+      expect(send).toHaveBeenCalledTimes(2);
+    });
+
+    it('still retries when the error carries no logs to attribute', async () => {
+      // The shape every client in this repo actually rethrows. The instruction
+      // index in a bare InstructionError addresses the caller's assembled
+      // transaction, which the SDK never sees, so there is nothing to resolve
+      // it against — and refusing to retry here would kill the single
+      // instruction case this whole path exists for.
+      const client = makeClient();
+      vi.spyOn(client, 'findNextMarketNonce').mockResolvedValueOnce(4n).mockResolvedValueOnce(5n);
+      vi.spyOn(client, 'createMarket').mockResolvedValue({
+        instructions: [],
+        marketPda: Keypair.generate().publicKey,
+      });
+      const send = vi
+        .fn()
+        .mockRejectedValueOnce(marketAlreadyExists)
+        .mockResolvedValue('sig-unattributable');
+
+      expect(
+        await client.createMarketWithFreshNonce(
+          Keypair.generate().publicKey,
+          Keypair.generate().publicKey,
+          marketArgs,
+          send
+        )
+      ).toBe('sig-unattributable');
+      expect(send).toHaveBeenCalledTimes(2);
+      expect('logs' in marketAlreadyExists).toBe(false);
+    });
+
+    it('does not retry when foreign-blaming logs live only under the JSON-RPC data member', async () => {
+      // Raw RPC -32002 shape: { err, logs } nested under `data`. The retry
+      // must reach that attribution evidence — reading only top-level `logs`
+      // would treat this as unattributable and burn a wallet signature.
+      const client = makeClient();
+      const probe = vi.spyOn(client, 'findNextMarketNonce').mockResolvedValueOnce(4n);
+      vi.spyOn(client, 'createMarket').mockResolvedValue({
+        instructions: [],
+        marketPda: Keypair.generate().publicKey,
+      });
+      const rpcForeign = {
+        code: -32002,
+        message: 'Transaction simulation failed: Error processing Instruction 0',
+        data: {
+          err: { InstructionError: [0, { Custom: 4 }] },
+          logs: [
+            `Program ${foreignProgram.toBase58()} invoke [1]`,
+            `Program ${foreignProgram.toBase58()} failed: custom program error: 0x4`,
+          ],
+        },
+      };
+      const send = vi.fn().mockRejectedValueOnce(rpcForeign);
+
+      await expect(
+        client.createMarketWithFreshNonce(
+          Keypair.generate().publicKey,
+          Keypair.generate().publicKey,
+          marketArgs,
+          send
+        )
+      ).rejects.toBe(rpcForeign);
+      expect(send).toHaveBeenCalledTimes(1);
+      expect(probe).toHaveBeenCalledTimes(1);
+    });
+
+    it('retries when the JSON-RPC data member blames this program', async () => {
+      const client = makeClient();
+      vi.spyOn(client, 'findNextMarketNonce').mockResolvedValueOnce(4n).mockResolvedValueOnce(5n);
+      vi.spyOn(client, 'createMarket').mockResolvedValue({
+        instructions: [],
+        marketPda: Keypair.generate().publicKey,
+      });
+      const rpcOwn = {
+        code: -32002,
+        message: 'Transaction simulation failed: Error processing Instruction 0',
+        data: {
+          err: { InstructionError: [0, { Custom: 4 }] },
+          logs: [`Program ${client.programId.toBase58()} failed: custom program error: 0x4`],
+        },
+      };
+      const send = vi.fn().mockRejectedValueOnce(rpcOwn).mockResolvedValue('sig-rpc-data');
+
+      expect(
+        await client.createMarketWithFreshNonce(
+          Keypair.generate().publicKey,
+          Keypair.generate().publicKey,
+          marketArgs,
+          send
+        )
+      ).toBe('sig-rpc-data');
+      expect(send).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  it('does not retry errors other than MarketAlreadyExists', async () => {
+    const client = makeClient();
+    vi.spyOn(client, 'findNextMarketNonce').mockResolvedValue(1n);
+    vi.spyOn(client, 'createMarket').mockResolvedValue({
+      instructions: [],
+      marketPda: Keypair.generate().publicKey,
+    });
+    const send = vi
+      .fn()
+      .mockRejectedValue(
+        Object.assign(new Error('nope'), { InstructionError: [2, { Custom: 8 }] })
+      );
+
+    await expect(
+      client.createMarketWithFreshNonce(
+        Keypair.generate().publicKey,
+        Keypair.generate().publicKey,
+        marketArgs,
+        send
+      )
+    ).rejects.toThrow('nope');
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it('never builds or sends when the probe fails', async () => {
+    const client = makeClient();
+    vi.spyOn(client, 'findNextMarketNonce').mockRejectedValue(
+      new Error("Couldn't check your existing loans — please try again.")
+    );
+    const build = vi.spyOn(client, 'createMarket');
+    const send = vi.fn();
+
+    await expect(
+      client.createMarketWithFreshNonce(
+        Keypair.generate().publicKey,
+        Keypair.generate().publicKey,
+        marketArgs,
+        send
+      )
+    ).rejects.toThrow("Couldn't check your existing loans");
+    expect(build).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  // ─── Realistic RPC error shapes ─────────────────────────────
+  //
+  // The tests above build the collision error as a structured
+  // `{ InstructionError: [ix, { Custom }] }` own-property object. Real
+  // callers rarely throw that shape — many JSON.stringify the
+  // RPC error into a plain Error message before the SDK sees it, so the
+  // retry's real-world code path is message-regex extraction
+  // (`parseCoalescefiError` Strategy 5 / the named-code fallback in
+  // `extractErrorCodeFromLog`), not the InstructionError strategy. These
+  // tests drive the retry with the actual stringified shapes so a break in
+  // message extraction can't hide behind the structured-shape tests above.
+  describe('realistic stringified error shapes', () => {
+    // Mirrors `new Error('Transaction failed on-chain: ' + JSON.stringify(err))`.
+    const prefixedJsonCollision = new Error(
+      'Transaction failed on-chain: {"InstructionError":[0,{"Custom":4}]}'
+    );
+    // Mirrors `new Error('Transaction failed: ' + JSON.stringify(err))`.
+    const plainJsonCollision = new Error(
+      'Transaction failed: {"InstructionError":[0,{"Custom":4}]}'
+    );
+    // Mirrors a decoded simulation error rethrown as friendly text.
+    const decodedSimulationCollision = new Error(
+      'Transaction would fail: Program error: MarketAlreadyExists — Market with this nonce already exists'
+    );
+
+    it('none of these carry a structured InstructionError own-property', () => {
+      // Sanity guard on the fixtures themselves: if this ever fails, the
+      // fixtures no longer exercise the message-regex path and the tests
+      // below would silently start hitting the (already-covered)
+      // InstructionError strategy instead.
+      expect('InstructionError' in prefixedJsonCollision).toBe(false);
+      expect('InstructionError' in plainJsonCollision).toBe(false);
+      expect('InstructionError' in decodedSimulationCollision).toBe(false);
+    });
+
+    it('retries exactly once and succeeds using the web-style stringified message', async () => {
+      const client = makeClient();
+      const probe = vi
+        .spyOn(client, 'findNextMarketNonce')
+        .mockResolvedValueOnce(4n)
+        .mockResolvedValueOnce(5n);
+      const build = vi
+        .spyOn(client, 'createMarket')
+        .mockResolvedValue({ instructions: [], marketPda: Keypair.generate().publicKey });
+      const send = vi.fn().mockRejectedValueOnce(prefixedJsonCollision).mockResolvedValue('sig-prefixed-json');
+
+      const result = await client.createMarketWithFreshNonce(
+        Keypair.generate().publicKey,
+        Keypair.generate().publicKey,
+        marketArgs,
+        send
+      );
+
+      expect(result).toBe('sig-prefixed-json');
+      expect(probe).toHaveBeenCalledTimes(2);
+      expect(send).toHaveBeenCalledTimes(2);
+      expect(build).toHaveBeenNthCalledWith(
+        2,
+        expect.anything(),
+        expect.anything(),
+        expect.objectContaining({ nonce: 5n })
+      );
+    });
+
+    it('retries exactly once and succeeds using an unprefixed stringified InstructionError message', async () => {
+      const client = makeClient();
+      const probe = vi
+        .spyOn(client, 'findNextMarketNonce')
+        .mockResolvedValueOnce(4n)
+        .mockResolvedValueOnce(5n);
+      vi.spyOn(client, 'createMarket').mockResolvedValue({
+        instructions: [],
+        marketPda: Keypair.generate().publicKey,
+      });
+      const send = vi
+        .fn()
+        .mockRejectedValueOnce(plainJsonCollision)
+        .mockResolvedValue('sig-plain-json');
+
+      const result = await client.createMarketWithFreshNonce(
+        Keypair.generate().publicKey,
+        Keypair.generate().publicKey,
+        marketArgs,
+        send
+      );
+
+      expect(result).toBe('sig-plain-json');
+      expect(probe).toHaveBeenCalledTimes(2);
+      expect(send).toHaveBeenCalledTimes(2);
+    });
+
+    it('retries exactly once using a decoded "Program error: MarketAlreadyExists" message', async () => {
+      const client = makeClient();
+      const probe = vi
+        .spyOn(client, 'findNextMarketNonce')
+        .mockResolvedValueOnce(4n)
+        .mockResolvedValueOnce(5n);
+      vi.spyOn(client, 'createMarket').mockResolvedValue({
+        instructions: [],
+        marketPda: Keypair.generate().publicKey,
+      });
+      const send = vi
+        .fn()
+        .mockRejectedValueOnce(decodedSimulationCollision)
+        .mockResolvedValue('sig-decoded-sim');
+
+      const result = await client.createMarketWithFreshNonce(
+        Keypair.generate().publicKey,
+        Keypair.generate().publicKey,
+        marketArgs,
+        send
+      );
+
+      expect(result).toBe('sig-decoded-sim');
+      expect(probe).toHaveBeenCalledTimes(2);
+      expect(send).toHaveBeenCalledTimes(2);
+    });
+
+    it('a second collision with the same realistic shape propagates rather than looping', async () => {
+      const client = makeClient();
+      const probe = vi.spyOn(client, 'findNextMarketNonce').mockResolvedValue(4n);
+      vi.spyOn(client, 'createMarket').mockResolvedValue({
+        instructions: [],
+        marketPda: Keypair.generate().publicKey,
+      });
+      const send = vi.fn().mockRejectedValue(prefixedJsonCollision);
+
+      await expect(
+        client.createMarketWithFreshNonce(
+          Keypair.generate().publicKey,
+          Keypair.generate().publicKey,
+          marketArgs,
+          send
+        )
+      ).rejects.toThrow();
+      expect(probe).toHaveBeenCalledTimes(2);
+      expect(send).toHaveBeenCalledTimes(2);
     });
   });
 });

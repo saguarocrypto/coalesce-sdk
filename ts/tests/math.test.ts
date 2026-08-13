@@ -13,7 +13,13 @@ import {
   calculateNormalizedAmount,
   calculateSettlementPayout,
   calculateAPR,
-  calculateNetAPR,
+  lenderAprPercent,
+  protocolFeePercent,
+  borrowerAllInPercent,
+  allInToStoredBps,
+  isTransformedRateModel,
+  borrowerTotalCostPercent,
+  transformedRemainingInterest,
   calculateTVL,
   calculatePositionValue,
   calculateTotalSupply,
@@ -974,30 +980,6 @@ describe('Math Utilities', () => {
     });
   });
 
-  describe('calculateNetAPR', () => {
-    it('should compute net APR after 10% protocol fee', () => {
-      // 800 bps gross, 1000 bps fee (10%) => 800 * 9000 / 10000 = 720
-      expect(calculateNetAPR(800, 1000)).toBe(720);
-    });
-
-    it('should return gross APR when fee is 0', () => {
-      expect(calculateNetAPR(800, 0)).toBe(800);
-    });
-
-    it('should return 0 when fee is 100%', () => {
-      expect(calculateNetAPR(800, 10000)).toBe(0);
-    });
-
-    it('should floor fractional results', () => {
-      // 1000 * (10000 - 333) / 10000 = 1000 * 9667 / 10000 = 966.7 => 966
-      expect(calculateNetAPR(1000, 333)).toBe(966);
-    });
-
-    it('should handle 0 gross APR', () => {
-      expect(calculateNetAPR(0, 1000)).toBe(0);
-    });
-  });
-
   describe('calculateTVL', () => {
     it('should compute TVL as deposited - borrowed + repaid', () => {
       const market = createMockMarket({
@@ -1034,6 +1016,170 @@ describe('Math Utilities', () => {
         totalRepaid: 0n,
       });
       expect(calculateTVL(market)).toBe(0n);
+    });
+  });
+
+  // Rate model. On-chain the lender scale factor grows at the FULL gross
+  // annual_interest_bps; the protocol fee is a separate, junior charge accrued
+  // ON TOP, not netted out of the lender's yield. So the lender APR IS the
+  // gross rate and the borrower's all-in cost = gross + fee. Netting the fee
+  // out of the lender APR misstates the yield lenders actually realize.
+  describe('lenderAprPercent', () => {
+    it('returns the full gross rate as a percent, never netting the fee', () => {
+      expect(lenderAprPercent(2000)).toBe(20);
+    });
+
+    it('returns zero for a zero rate', () => {
+      expect(lenderAprPercent(0)).toBe(0);
+    });
+  });
+
+  describe('protocolFeePercent', () => {
+    it('is the junior fee charged on top, as a percent of principal (10% of a 20% rate = 2%)', () => {
+      expect(protocolFeePercent(2000, 1000)).toBeCloseTo(2, 10);
+    });
+
+    it('is zero when no fee is configured', () => {
+      expect(protocolFeePercent(2000, 0)).toBe(0);
+    });
+  });
+
+  describe('borrowerAllInPercent', () => {
+    it("is the borrower's total cost: gross plus fee (20% + 10%-of-interest = 22%)", () => {
+      expect(borrowerAllInPercent(2000, 1000)).toBeCloseTo(22, 10);
+    });
+
+    it('equals the lender APR when there is no protocol fee', () => {
+      expect(borrowerAllInPercent(1400, 0)).toBe(14);
+    });
+  });
+
+  // All-in rate transform. The borrower's entered rate is their ALL-IN
+  // cost; because the program charges stored gross + fee on top, NEW loans store
+  // a reduced rate `allInToStoredBps` so the borrower's all-in lands on what they
+  // entered. Loans created before the cutover stored the all-in directly (legacy).
+  describe('allInToStoredBps', () => {
+    it('reduces the entered all-in so gross + fee lands back on it (20% all-in, 10% fee → 18.18%)', () => {
+      const stored = allInToStoredBps(2000, 1000);
+      expect(stored).toBe(1818);
+      // Round-trip: the borrower's displayed all-in returns to ~20%.
+      expect(borrowerAllInPercent(stored, 1000)).toBeCloseTo(20, 1);
+    });
+
+    it('reduces a 14% all-in at 10% fee to 12.73% stored', () => {
+      expect(allInToStoredBps(1400, 1000)).toBe(1273);
+    });
+
+    it('is a no-op when there is no protocol fee', () => {
+      expect(allInToStoredBps(2000, 0)).toBe(2000);
+    });
+  });
+
+  describe('isTransformedRateModel', () => {
+    // CargoBill's pre-transform market is in the frozen legacy allowlist.
+    const LEGACY = 'Cx9cyLRNKPWmV3cinuHAjdP9EgjR71V5J1JZCmS4yHN7';
+    const NEW = 'NewMarket1111111111111111111111111111111111';
+
+    it('treats any market NOT in the legacy allowlist as transformed', () => {
+      expect(isTransformedRateModel(NEW)).toBe(true);
+    });
+
+    it('treats frozen legacy-allowlist markets as legacy', () => {
+      expect(isTransformedRateModel(LEGACY)).toBe(false);
+    });
+
+    it('treats unknown/missing address as transformed (fee-inclusive)', () => {
+      // The legacy set is a frozen, complete allowlist, so anything
+      // unidentified belongs to the growing transformed majority. Defaulting
+      // to legacy silently dropped the protocol fee from the borrower's
+      // displayed cost whenever a caller had bps but no address — e.g. a
+      // pre-creation preview, which is by definition a new, transformed market.
+      expect(isTransformedRateModel(null)).toBe(true);
+      expect(isTransformedRateModel(undefined)).toBe(true);
+      expect(isTransformedRateModel('')).toBe(true);
+    });
+  });
+
+  describe('borrowerTotalCostPercent', () => {
+    const LEGACY = 'Cx9cyLRNKPWmV3cinuHAjdP9EgjR71V5J1JZCmS4yHN7';
+    const NEW = 'NewMarket1111111111111111111111111111111111';
+
+    it('adds the fee on top for transformed loans (stored 18.18% + fee → ~20%)', () => {
+      expect(borrowerTotalCostPercent(1818, 1000, NEW)).toBeCloseTo(20, 1);
+    });
+
+    it('uses the stored rate as the total for legacy loans (no fee added)', () => {
+      // CargoBill's legacy 14% loan: borrower agreed 14% all-in → total cost is 14%.
+      expect(borrowerTotalCostPercent(1400, 1000, LEGACY)).toBe(14);
+    });
+
+    it('includes the fee for an unknown/missing address instead of understating the cost', () => {
+      expect(borrowerTotalCostPercent(1818, 1000, null)).toBeCloseTo(20, 1);
+      expect(borrowerTotalCostPercent(1818, 1000, undefined)).toBeCloseTo(20, 1);
+    });
+  });
+
+  describe('transformedRemainingInterest (program-exact fee basis)', () => {
+    // gross 100 USDC: 1000 supply at 1.1 scale factor − 1000 deposited.
+    // lastAccrual far in the future ⇒ no projection (totalGrowthWad = WAD,
+    // projectedFeeDelta = 0), so the result depends only on the persisted fee
+    // accumulators, not on the current fee.
+    const base = {
+      scaledTotalSupply: 1_000_000_000n,
+      scaleFactor: 1_100_000_000_000_000_000n,
+      totalDeposited: 1_000_000_000n,
+      totalInterestRepaid: 0n,
+      lastAccrualTimestamp: 9_999_999_999n,
+      maturityTimestamp: 9_999_999_999n,
+      annualInterestBps: 2000,
+      accruedProtocolFees: 10_000_000n, // $10 fee already accrued by the program
+      totalCollectedFee: 0n,
+      settlementFactorWad: 0n,
+    };
+    const NOW = 1_000_000_000n;
+
+    it('owes gross + the program-accrued fee (accumulator, not current fee)', () => {
+      // 100 gross + 10 accrued fee = 110, regardless of the live fee passed in.
+      expect(transformedRemainingInterest(base, NOW, 0)).toBe(110_000_000n);
+      expect(transformedRemainingInterest(base, NOW, 5000)).toBe(110_000_000n);
+    });
+
+    it('adds back collected fees so a mid-loan sweep does not undercharge', () => {
+      // accrued was decremented to 1 by a collect_fees that swept 9; total fee
+      // owed is still 10. With 99 already repaid: 100 + (1 + 9) − 99 = 11.
+      const swept = {
+        ...base,
+        accruedProtocolFees: 1_000_000n,
+        totalCollectedFee: 9_000_000n,
+        totalInterestRepaid: 99_000_000n,
+      };
+      expect(transformedRemainingInterest(swept, NOW, 1000)).toBe(11_000_000n);
+    });
+
+    it('charges the live fee only on interest accrued since the last accrual', () => {
+      // 1 day at 365% APR ⇒ +1% growth ⇒ 10 USDC new gross; the projected fee on
+      // that sliver uses the CURRENT fee. No prior accrual.
+      const projecting = {
+        ...base,
+        scaleFactor: 1_000_000_000_000_000_000n, // 1.0
+        lastAccrualTimestamp: 1_000_000_000n,
+        maturityTimestamp: 2_000_000_000n,
+        annualInterestBps: 36_500, // 1%/day
+        accruedProtocolFees: 0n,
+      };
+      const oneDayLater = 1_000_086_400n;
+      // gross 10 only (fee 0):
+      expect(transformedRemainingInterest(projecting, oneDayLater, 0)).toBe(10_000_000n);
+      // gross 10 + 10% fee on the sliver = 11:
+      expect(transformedRemainingInterest(projecting, oneDayLater, 1000)).toBe(11_000_000n);
+      // gross 10 + 50% fee on the sliver = 15:
+      expect(transformedRemainingInterest(projecting, oneDayLater, 5000)).toBe(15_000_000n);
+    });
+
+    it('returns null once the market is settled', () => {
+      expect(
+        transformedRemainingInterest({ ...base, settlementFactorWad: 1n }, NOW, 1000)
+      ).toBeNull();
     });
   });
 });

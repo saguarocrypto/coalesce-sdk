@@ -76,6 +76,15 @@ describe('PDA Derivations', () => {
       expect(pda).toBeInstanceOf(PublicKey);
       expect(bump).toBeGreaterThanOrEqual(0);
     });
+
+    it('rejects nonces outside the u64 range instead of silently wrapping', () => {
+      // setBigUint64 wraps modulo 2^64, so without the guard
+      // findMarketPda(borrower, 2n ** 64n) silently derives nonce 0's PDA —
+      // targeting the borrower's FIRST market instead of failing.
+      const borrower = Keypair.generate().publicKey;
+      expect(() => findMarketPda(borrower, 1n << 64n, testProgramId)).toThrow(RangeError);
+      expect(() => findMarketPda(borrower, -1n, testProgramId)).toThrow(RangeError);
+    });
   });
 
   describe('findMarketAuthorityPda', () => {

@@ -1,4 +1,4 @@
-import { TOKEN_PROGRAM_ID, getAssociatedTokenAddress } from '@solana/spl-token';
+import { TOKEN_PROGRAM_ID } from '@solana/spl-token';
 import {
   type Connection,
   type Keypair,
@@ -8,17 +8,24 @@ import {
   sendAndConfirmTransaction,
 } from '@solana/web3.js';
 
-import { fetchLenderPosition, fetchMarket } from './accounts';
+import {
+  fetchLenderPosition,
+  fetchMarket,
+  findNextMarketNonce,
+  type FindNextMarketNonceOptions,
+} from './accounts';
 import { ProtocolCache } from './client/cache';
 import {
   resolveLenderAccounts,
   resolveBorrowerAccounts,
   resolveSettlementAccounts,
+  resolveAta,
+  buildRecipientAtaIxs,
   getSystemProgramId,
   getProgramDataPda,
 } from './client/resolve';
 import { DEFAULT_PROGRAM_IDS } from './constants';
-import { SdkError, withErrorHandling } from './errors';
+import { SdkError, withErrorHandling, parseCoalescefiError, CoalescefiErrorCode } from './errors';
 import {
   createInitializeProtocolInstruction,
   createSetFeeConfigInstruction,
@@ -208,7 +215,8 @@ export class CoalesceClient {
         this.programId
       );
 
-      return [ix];
+      const ataIxs = await buildRecipientAtaIxs(lender, market.mint, resolved.lenderTokenAccount);
+      return [...ataIxs, ix];
     }, 'withdraw');
   }
 
@@ -351,7 +359,8 @@ export class CoalesceClient {
         this.programId
       );
 
-      return [ix];
+      const ataIxs = await buildRecipientAtaIxs(lender, market.mint, resolved.lenderTokenAccount);
+      return [...ataIxs, ix];
     }, 'claimHaircut');
   }
 
@@ -382,6 +391,22 @@ export class CoalesceClient {
   }
 
   // ─── Borrower Operations ────────────────────────────────────
+
+  /**
+   * Find this borrower's next unused market nonce by probing the chain.
+   *
+   * Bypasses the client's account cache on purpose — a cached result would
+   * reintroduce the staleness this is designed to avoid.
+   */
+  async findNextMarketNonce(
+    borrower: PublicKey,
+    options?: FindNextMarketNonceOptions
+  ): Promise<bigint> {
+    return this.wrap(
+      () => findNextMarketNonce(this.connection, borrower, this.programId, options),
+      'findNextMarketNonce'
+    );
+  }
 
   async createMarket(
     borrower: PublicKey,
@@ -423,6 +448,83 @@ export class CoalesceClient {
     }, 'createMarket');
   }
 
+  /**
+   * Derive a fresh market nonce, build the create-market instructions, and send
+   * them via the caller's `send` function — retrying exactly once if the chain
+   * reports the nonce was taken between the probe and confirmation.
+   *
+   * The probe closes the indexer-lag hole but not the concurrent-submit window:
+   * another tab or device can claim the nonce in between. One retry covers that;
+   * a second collision is a bug rather than a race, and is allowed to surface.
+   *
+   * The retry re-probes with a floor of `collided + 1` rather than from 0. The
+   * collision is reported by whatever RPC `send` used, which on web is the
+   * wallet's — potentially further ahead than `this.connection`. A lagging
+   * re-probe would otherwise still see the collided PDA as free, hand back the
+   * same nonce, and burn the single retry on an identical doomed transaction.
+   *
+   * `send` is a callback so each client keeps its own wallet and transaction
+   * plumbing while this orchestration stays in one place. `send` should submit
+   * ONLY the instructions it is given: bundling instructions for other
+   * programs into the same transaction means a foreign program's `Custom(4)`,
+   * surfaced as a bare stringified message with no logs, is indistinguishable
+   * from a nonce collision and burns the single retry on a failure a fresh
+   * nonce cannot fix.
+   *
+   * `Custom(4)` only means `MarketAlreadyExists` when THIS program raised it.
+   * A caller whose `send` bundles other instructions can have the whole
+   * transaction rolled back by some other program's fourth error code, and
+   * retrying that burns a second wallet signature on a deterministic failure
+   * that a fresh nonce cannot fix. Transaction logs name the failing program,
+   * so when they are present the code is attributed before retrying (the
+   * `programId` option of `parseCoalescefiError`).
+   *
+   * Attribution is one-directional on purpose: only affirmative evidence of a
+   * FOREIGN program suppresses the retry. Errors that reach the SDK as a
+   * stringified message (many wallet stacks rethrow one) or as a bare
+   * `InstructionError` carry no logs, and the instruction index in them
+   * addresses the caller's assembled transaction, which this method never
+   * sees — there is nothing to resolve it against. Those stay retryable: the
+   * single-instruction create-market send is the case this whole path exists
+   * for, and refusing to retry it whenever attribution is merely unavailable
+   * would disable it for most callers.
+   *
+   * Deliberately not routed through `wrap()`: `send` errors must reach the
+   * caller unmodified so the collision check above can read the program's
+   * custom error code.
+   */
+  async createMarketWithFreshNonce(
+    borrower: PublicKey,
+    mint: PublicKey,
+    args: Omit<ClientCreateMarketArgs, 'nonce'>,
+    send: (instructions: TransactionInstruction[]) => Promise<string>,
+    options?: FindNextMarketNonceOptions
+  ): Promise<string> {
+    const buildAndSend = async (nonce: bigint): Promise<string> => {
+      const { instructions } = await this.createMarket(borrower, mint, { ...args, nonce });
+      return send(instructions);
+    };
+
+    const nonce = await this.findNextMarketNonce(borrower, options);
+    try {
+      return await buildAndSend(nonce);
+    } catch (error) {
+      // The programId option applies the one-directional attribution described
+      // above: logs that blame a foreign program suppress the parse, while an
+      // unattributable error (no logs) still parses. See above.
+      const parsed = parseCoalescefiError(error, { programId: this.programId });
+      if (parsed?.code !== CoalescefiErrorCode.MarketAlreadyExists) {
+        throw error;
+      }
+      const retryFloor = nonce + 1n;
+      const minNonce =
+        options?.minNonce !== undefined && options.minNonce > retryFloor
+          ? options.minNonce
+          : retryFloor;
+      return buildAndSend(await this.findNextMarketNonce(borrower, { ...options, minNonce }));
+    }
+  }
+
   async borrow(
     borrower: PublicKey,
     marketPda: PublicKey,
@@ -459,7 +561,15 @@ export class CoalesceClient {
         this.programId
       );
 
-      return [ix];
+      // Self-heal a missing destination ATA: the program rejects a non-existent
+      // borrower token account with InvalidAccountOwner. Idempotent — no-op when
+      // it already exists; the borrower funds it (EOA wallet or multisig signer).
+      const ataIxs = await buildRecipientAtaIxs(
+        borrower,
+        market.mint,
+        resolved.borrowerTokenAccount
+      );
+      return [...ataIxs, ix];
     }, 'borrow');
   }
 
@@ -483,8 +593,7 @@ export class CoalesceClient {
       const [borrowerWhitelist] = findBorrowerWhitelistPda(market.borrower, this.programId);
 
       const payerTokenAccount =
-        overrides?.payerTokenAccount ??
-        (await getAssociatedTokenAddress(market.mint, payer, true, TOKEN_PROGRAM_ID));
+        overrides?.payerTokenAccount ?? (await resolveAta(payer, market.mint));
 
       return createWaterfallRepayInstructions(
         {
@@ -537,7 +646,12 @@ export class CoalesceClient {
         this.programId
       );
 
-      return [ix];
+      const ataIxs = await buildRecipientAtaIxs(
+        borrower,
+        market.mint,
+        resolved.borrowerTokenAccount
+      );
+      return [...ataIxs, ix];
     }, 'withdrawExcess');
   }
 
@@ -628,9 +742,10 @@ export class CoalesceClient {
       const market = await this.cache.getMarket(this.connection, marketPda);
       const settlement = resolveSettlementAccounts(this.programId, marketPda);
 
+      // resolveAta allows off-curve owners, so an off-curve fee authority
+      // (e.g. a Squads vault) derives — and self-heals — its canonical ATA.
       const feeTokenAccount =
-        overrides?.feeTokenAccount ??
-        (await getAssociatedTokenAddress(market.mint, feeAuthority, false, TOKEN_PROGRAM_ID));
+        overrides?.feeTokenAccount ?? (await resolveAta(feeAuthority, market.mint));
 
       const ix = createCollectFeesInstruction(
         {
@@ -645,15 +760,25 @@ export class CoalesceClient {
         this.programId
       );
 
-      return [ix];
+      const ataIxs = await buildRecipientAtaIxs(
+        feeAuthority,
+        market.mint,
+        feeTokenAccount,
+        overrides?.ataRentPayer
+      );
+      return [...ataIxs, ix];
     }, 'collectFees');
   }
 
   // ─── Discovery & Reading State ──────────────────────────────
 
   getMarketAddress(borrower: PublicKey, nonce: bigint = 0n): PublicKey {
-    const [pda] = findMarketPda(borrower, nonce, this.programId);
-    return pda;
+    // wrapSync: findMarketPda throws a raw RangeError for nonces outside the
+    // u64 range; every client method's contract is SdkError/CoalescefiError.
+    return this.wrapSync(() => {
+      const [pda] = findMarketPda(borrower, nonce, this.programId);
+      return pda;
+    }, 'getMarketAddress');
   }
 
   async getMarket(marketPda: PublicKey): Promise<Market | null> {
@@ -724,9 +849,13 @@ export class CoalesceClient {
     }
 
     const tx = new Transaction().add(...instructions);
+    // programId: the instruction list may carry a prepended create-ATA ix, so
+    // a custom error code in the result is only decoded as a Coalesce error
+    // when the logs do not blame another program.
     return withErrorHandling(
       () => sendAndConfirmTransaction(this.connection, tx, signers),
-      'Transaction failed'
+      'Transaction failed',
+      { programId: this.programId }
     );
   }
 

@@ -1,4 +1,4 @@
-import { Keypair } from '@solana/web3.js';
+import { Keypair, SystemProgram } from '@solana/web3.js';
 import { describe, expect, it, vi } from 'vitest';
 
 import {
@@ -12,6 +12,7 @@ import {
   fetchMarket,
   fetchLenderPosition,
   fetchBorrowerWhitelist,
+  findNextMarketNonce,
 } from '../src/accounts';
 import {
   PROTOCOL_CONFIG_SIZE,
@@ -23,6 +24,7 @@ import {
   DISC_LENDER_POSITION,
   DISC_BORROWER_WL,
 } from '../src/constants';
+import { findMarketPda } from '../src/pdas';
 
 describe('Account Decoders', () => {
   describe('getAccountType', () => {
@@ -560,6 +562,420 @@ describe('Account Decoders', () => {
           fetchProtocolConfig(mockConnection, address, { maxRetries: 2, baseDelayMs: 10 })
         ).rejects.toThrow('rate limit 429');
       });
+    });
+  });
+});
+
+describe('findNextMarketNonce', () => {
+  const borrower = Keypair.generate().publicKey;
+  const programId = Keypair.generate().publicKey;
+
+  // An initialised market: a PDA owned by the Coalesce program.
+  const marketAccount = () => ({ owner: programId, data: Buffer.alloc(0), lamports: 2_000_000 });
+
+  // Returns a mock Connection whose getMultipleAccountsInfo reports the given
+  // nonces as occupied. `occupied` is a set of nonce numbers. `probeStart` is
+  // the first nonce the probe is expected to ask about (matters when a minNonce
+  // floor is in play, since the mock maps keys to nonces positionally).
+  function createProbeConnection(occupied: Set<number>, probeStart = 0) {
+    let offset = probeStart;
+    const getMultipleAccountsInfo = vi
+      .fn()
+      .mockImplementation(async (keys: unknown[], config?: unknown) => {
+        // Track a running offset to handle variable-sized batches (especially
+        // the final truncated batch). The Nth key in the current call corresponds
+        // to nonce offset + N.
+        const start = offset;
+        offset += keys.length;
+        void config;
+        return keys.map((_, i) => (occupied.has(start + i) ? marketAccount() : null));
+      });
+    return {
+      connection: { getMultipleAccountsInfo } as unknown as import('@solana/web3.js').Connection,
+      getMultipleAccountsInfo,
+    };
+  }
+
+  it('returns 0n when the borrower has no markets', async () => {
+    const { connection } = createProbeConnection(new Set());
+    expect(await findNextMarketNonce(connection, borrower, programId)).toBe(0n);
+  });
+
+  it('returns the next nonce above a contiguous run', async () => {
+    const { connection } = createProbeConnection(new Set([0, 1, 2, 3, 4]));
+    expect(await findNextMarketNonce(connection, borrower, programId)).toBe(5n);
+  });
+
+  it('fills a gap left by a sparse nonce scheme', async () => {
+    const { connection } = createProbeConnection(new Set([0, 1, 3]));
+    expect(await findNextMarketNonce(connection, borrower, programId)).toBe(2n);
+  });
+
+  it('probes a second batch when the first is fully occupied', async () => {
+    const occupied = new Set(Array.from({ length: 16 }, (_, i) => i));
+    const { connection, getMultipleAccountsInfo } = createProbeConnection(occupied);
+
+    expect(await findNextMarketNonce(connection, borrower, programId)).toBe(16n);
+    expect(getMultipleAccountsInfo).toHaveBeenCalledTimes(2);
+  });
+
+  it('requests zero account bytes so probes stay cheap', async () => {
+    const { connection, getMultipleAccountsInfo } = createProbeConnection(new Set());
+
+    await findNextMarketNonce(connection, borrower, programId);
+
+    expect(getMultipleAccountsInfo).toHaveBeenCalledWith(
+      expect.any(Array),
+      expect.objectContaining({
+        commitment: 'confirmed',
+        dataSlice: { offset: 0, length: 0 },
+      })
+    );
+  });
+
+  it('probes distinct addresses within a batch', async () => {
+    const { connection, getMultipleAccountsInfo } = createProbeConnection(new Set());
+
+    await findNextMarketNonce(connection, borrower, programId);
+
+    const keys = getMultipleAccountsInfo.mock.calls[0]?.[0] as { toBase58(): string }[];
+    expect(keys).toHaveLength(16);
+    expect(new Set(keys.map((k) => k.toBase58())).size).toBe(16);
+  });
+
+  it('throws once the probe ceiling is reached', async () => {
+    const occupied = new Set(Array.from({ length: 32 }, (_, i) => i));
+    const { connection } = createProbeConnection(occupied);
+
+    await expect(
+      findNextMarketNonce(connection, borrower, programId, { maxProbe: 32n })
+    ).rejects.toThrow(/32/);
+  });
+
+  it('surfaces a user-facing message when the RPC call fails', async () => {
+    const connection = {
+      getMultipleAccountsInfo: vi.fn().mockRejectedValue(new Error('429 Too Many Requests')),
+    } as unknown as import('@solana/web3.js').Connection;
+
+    const { SdkError: SdkErrorClass } = await import('../src/errors');
+    expect.assertions(3);
+
+    try {
+      await findNextMarketNonce(connection, borrower, programId, {
+        retryConfig: { maxRetries: 0, baseDelayMs: 1 },
+      });
+      expect.fail('should have thrown');
+    } catch (error) {
+      expect(error).toBeInstanceOf(SdkErrorClass);
+      expect((error as InstanceType<typeof SdkErrorClass>).type).toBe('network');
+      expect((error as Error).message).toContain("Couldn't check your existing loans");
+    }
+  });
+
+  it('probes and returns from a truncated final batch', async () => {
+    // Occupy nonces 0-9 so the truncated third batch (10-11) is actually reached
+    const occupied = new Set([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    const { connection, getMultipleAccountsInfo } = createProbeConnection(occupied);
+
+    // batchSize: 5, maxProbe: 12n means:
+    // Batch 1: nonces 0-4 (5 addresses) — all occupied
+    // Batch 2: nonces 5-9 (5 addresses) — all occupied
+    // Batch 3: nonces 10-11 (2 addresses, truncated) — nonce 10 is free
+    const result = await findNextMarketNonce(connection, borrower, programId, {
+      batchSize: 5,
+      maxProbe: 12n,
+    });
+
+    expect(result).toBe(10n);
+
+    // Verify the third RPC call received exactly 2 addresses (truncated batch)
+    const thirdCall = getMultipleAccountsInfo.mock.calls[2];
+    expect(thirdCall?.[0]).toHaveLength(2);
+
+    // Verify exactly 3 RPC calls were made
+    expect(getMultipleAccountsInfo).toHaveBeenCalledTimes(3);
+  });
+
+  it('enforces the ceiling when maxProbe is not a multiple of batchSize', async () => {
+    // Occupy all nonces 0-11, so without the truncation guard it would try to probe
+    // nonces 10-14 in the third batch, find 12 free, and incorrectly return 12
+    // (which exceeds maxProbe: 12n). The guard ensures it stops at 12n.
+    const occupied = new Set([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+    const { connection } = createProbeConnection(occupied);
+
+    // With batchSize: 5, maxProbe: 12n and all nonces occupied, should throw
+    // because there are no free nonces in the range [0, 12n).
+    await expect(
+      findNextMarketNonce(connection, borrower, programId, {
+        batchSize: 5,
+        maxProbe: 12n,
+      })
+    ).rejects.toThrow(/12/);
+  });
+
+  it('throws if batchSize is 0 and does not hang', async () => {
+    const { connection } = createProbeConnection(new Set());
+
+    await expect(
+      findNextMarketNonce(connection, borrower, programId, { batchSize: 0 })
+    ).rejects.toThrow(/batchSize/i);
+  }, 1000);
+
+  it('throws if batchSize is negative and does not hang', async () => {
+    const { connection } = createProbeConnection(new Set());
+
+    await expect(
+      findNextMarketNonce(connection, borrower, programId, { batchSize: -1 })
+    ).rejects.toThrow(/batchSize/i);
+  }, 1000);
+
+  it('rejects batchSize above the getMultipleAccountsInfo limit as validation, not network', async () => {
+    // The RPC caps getMultipleAccountsInfo at 100 accounts, so a larger batch
+    // fails deterministically on every attempt. It must be classified as a
+    // validation error BEFORE any RPC call — not wrapped as a retryable
+    // "please try again" network error by the RPC failure path.
+    const { connection, getMultipleAccountsInfo } = createProbeConnection(new Set());
+
+    await expect(
+      findNextMarketNonce(connection, borrower, programId, { batchSize: 128 })
+    ).rejects.toMatchObject({ type: 'validation' });
+    expect(getMultipleAccountsInfo).not.toHaveBeenCalled();
+  });
+
+  it('rejects fractional and NaN batchSize as SdkError instead of leaking a RangeError', async () => {
+    // BigInt(1.5) throws a raw RangeError; the documented contract is
+    // SdkError('network' | 'validation') only.
+    const { connection } = createProbeConnection(new Set());
+
+    await expect(
+      findNextMarketNonce(connection, borrower, programId, { batchSize: 1.5 })
+    ).rejects.toMatchObject({ type: 'validation' });
+    await expect(
+      findNextMarketNonce(connection, borrower, programId, { batchSize: Number.NaN })
+    ).rejects.toMatchObject({ type: 'validation' });
+  });
+
+  it('rejects a minNonce at or past the end of the u64 nonce space', async () => {
+    // minNonce = 2^64 passes a bare negative-check, runs zero loop iterations,
+    // and would previously rethrow the exhaustion error with the degenerate
+    // range [2^64, 2^64) — including when a caller follows the exhaustion
+    // error's own "raise minNonce" advice at the top of the space.
+    const { connection } = createProbeConnection(new Set());
+
+    await expect(
+      findNextMarketNonce(connection, borrower, programId, { minNonce: 1n << 64n })
+    ).rejects.toMatchObject({ type: 'validation' });
+    await expect(
+      findNextMarketNonce(connection, borrower, programId, { minNonce: 1n << 64n })
+    ).rejects.toThrow(/minNonce/i);
+  });
+
+  it('does not advise raising minNonce when the probe window is clamped at the end of the u64 space', async () => {
+    // Occupy the last two slots of the nonce space; the window clamps at 2^64,
+    // so "retry with a minNonce above {probeEnd}" would only reproduce the
+    // same error.
+    const topFloor = (1n << 64n) - 2n;
+    const getMultipleAccountsInfo = vi
+      .fn()
+      .mockImplementation(async (keys: unknown[]) => keys.map(() => marketAccount()));
+    const connection = {
+      getMultipleAccountsInfo,
+    } as unknown as import('@solana/web3.js').Connection;
+
+    const rejection = expect(
+      findNextMarketNonce(connection, borrower, programId, { minNonce: topFloor })
+    ).rejects;
+    await rejection.toThrow(/end of the u64 nonce space/i);
+    await expect(
+      findNextMarketNonce(connection, borrower, programId, { minNonce: topFloor })
+    ).rejects.not.toThrow(/minNonce above/i);
+  });
+
+  // ─── Occupancy is ownership, not existence ──────────────────
+  //
+  // `create_market` calls `create_account_with_minimum_balance_signed`, which
+  // transfers the rent shortfall into an already-funded PDA and then allocates
+  // it. A system-owned PDA holding nothing but lamports is therefore still
+  // usable. If the probe treated any non-null account as occupied, anyone could
+  // send 1 lamport to each of a borrower's first 256 market PDAs and lock them
+  // out of creating loans — cheap, and with no transaction of theirs failing.
+  describe('occupancy is decided by account owner', () => {
+    // A PDA someone dusted: exists, holds lamports, still system-owned.
+    const dustedAccount = () => ({
+      owner: SystemProgram.programId,
+      data: Buffer.alloc(0),
+      lamports: 1,
+    });
+
+    function connectionReturning(accounts: (object | null)[]) {
+      const getMultipleAccountsInfo = vi.fn().mockResolvedValue(accounts);
+      return {
+        connection: { getMultipleAccountsInfo } as unknown as import('@solana/web3.js').Connection,
+        getMultipleAccountsInfo,
+      };
+    }
+
+    it('treats a dust-prefunded, system-owned PDA as available', async () => {
+      const { connection } = connectionReturning([dustedAccount()]);
+
+      expect(await findNextMarketNonce(connection, borrower, programId, { batchSize: 1 })).toBe(0n);
+    });
+
+    it('treats a program-owned market PDA as occupied', async () => {
+      const { connection } = connectionReturning([marketAccount(), null]);
+
+      expect(await findNextMarketNonce(connection, borrower, programId, { batchSize: 2 })).toBe(1n);
+    });
+
+    it('treats a null account as available', async () => {
+      const { connection } = connectionReturning([null]);
+
+      expect(await findNextMarketNonce(connection, borrower, programId, { batchSize: 1 })).toBe(0n);
+    });
+
+    it('is not grieved by dusting a whole batch of market PDAs', async () => {
+      const { connection, getMultipleAccountsInfo } = connectionReturning([
+        dustedAccount(),
+        dustedAccount(),
+        dustedAccount(),
+        dustedAccount(),
+      ]);
+
+      expect(await findNextMarketNonce(connection, borrower, programId, { batchSize: 4 })).toBe(0n);
+      // One round trip: the dust never pushed the probe onward.
+      expect(getMultipleAccountsInfo).toHaveBeenCalledTimes(1);
+    });
+
+    // The owner arrives regardless of dataSlice, so the ownership check costs
+    // no extra bandwidth — verified against a live RPC, which returns `owner`
+    // even for `dataSlice: { offset: 0, length: 0 }`.
+    it('keeps the zero-byte dataSlice bandwidth optimisation', async () => {
+      const { connection, getMultipleAccountsInfo } = connectionReturning([marketAccount(), null]);
+
+      await findNextMarketNonce(connection, borrower, programId, { batchSize: 2 });
+
+      expect(getMultipleAccountsInfo).toHaveBeenCalledWith(
+        expect.any(Array),
+        expect.objectContaining({ dataSlice: { offset: 0, length: 0 } })
+      );
+    });
+
+    it('treats an account owned by a different program as available', async () => {
+      // Sanity check on the comparison itself: occupancy must be keyed to the
+      // program id passed in, not to "owned by something".
+      const otherProgram = Keypair.generate().publicKey;
+      const { connection } = connectionReturning([
+        { owner: otherProgram, data: Buffer.alloc(0), lamports: 1 },
+      ]);
+
+      expect(await findNextMarketNonce(connection, borrower, programId, { batchSize: 1 })).toBe(0n);
+    });
+  });
+
+  // ─── minNonce floor ─────────────────────────────────────────
+  describe('minNonce', () => {
+    it('never returns a nonce below the floor, even when lower slots are free', async () => {
+      const { connection } = createProbeConnection(new Set(), 5);
+
+      expect(
+        await findNextMarketNonce(connection, borrower, programId, { minNonce: 5n, batchSize: 4 })
+      ).toBe(5n);
+    });
+
+    it('probes only addresses at or above the floor', async () => {
+      const { connection, getMultipleAccountsInfo } = createProbeConnection(new Set(), 3);
+
+      await findNextMarketNonce(connection, borrower, programId, { minNonce: 3n, batchSize: 2 });
+
+      const keys = getMultipleAccountsInfo.mock.calls[0]?.[0] as { toBase58(): string }[];
+      expect(keys.map((k) => k.toBase58())).toEqual([
+        findMarketPda(borrower, 3n, programId)[0].toBase58(),
+        findMarketPda(borrower, 4n, programId)[0].toBase58(),
+      ]);
+    });
+
+    it('rejects a negative floor', async () => {
+      const { connection } = createProbeConnection(new Set());
+
+      await expect(
+        findNextMarketNonce(connection, borrower, programId, { minNonce: -1n })
+      ).rejects.toThrow(/minNonce/i);
+    });
+  });
+
+  // ─── maxProbe is a window, not an absolute ceiling ───────────
+  //
+  // `maxProbe` counts nonces probed, measured from `minNonce`. Treated as an
+  // absolute ceiling instead, raising the floor would silently shrink the
+  // search — and the create-market retry, whose whole job is to raise the
+  // floor past a collision, would probe fewer and fewer candidates the closer
+  // the collision sat to the ceiling (and none at all at the ceiling itself).
+  describe('maxProbe window', () => {
+    it('probes a full window above a caller-supplied floor', async () => {
+      // Floor 250 with the default 256-wide window covers [250, 506), so the
+      // free slot at 301 is inside it. An absolute ceiling of 256 would have
+      // probed only 250-255 and thrown.
+      const occupied = new Set(Array.from({ length: 51 }, (_, i) => 250 + i));
+      const { connection } = createProbeConnection(occupied, 250);
+
+      expect(await findNextMarketNonce(connection, borrower, programId, { minNonce: 250n })).toBe(
+        301n
+      );
+    });
+
+    it('clamps the window to the end of the u64 nonce space', async () => {
+      // Three nonces left below 2^64. The window must stop there rather than
+      // deriving a PDA for a nonce that does not fit a u64 seed.
+      const getMultipleAccountsInfo = vi
+        .fn()
+        .mockImplementation(async (keys: unknown[]) => keys.map(() => marketAccount()));
+      const connection = {
+        getMultipleAccountsInfo,
+      } as unknown as import('@solana/web3.js').Connection;
+
+      await expect(
+        findNextMarketNonce(connection, borrower, programId, {
+          minNonce: 2n ** 64n - 3n,
+          batchSize: 8,
+        })
+      ).rejects.toThrow(/18446744073709551616/);
+
+      expect(getMultipleAccountsInfo).toHaveBeenCalledTimes(1);
+      expect(getMultipleAccountsInfo.mock.calls[0]?.[0]).toHaveLength(3);
+    });
+
+    it('rejects a maxProbe of zero rather than probing nothing', async () => {
+      const { connection } = createProbeConnection(new Set());
+
+      await expect(
+        findNextMarketNonce(connection, borrower, programId, { maxProbe: 0n })
+      ).rejects.toThrow(/Invalid maxProbe: 0\b/);
+    });
+
+    it('names the bound that stopped the search, and how to move it', async () => {
+      // The window is a client-side cost limit, not a protocol one — the
+      // on-chain nonce is a u64. A caller who exhausts it must be pointed at
+      // the knob, otherwise a borrower with a dense run of markets reads the
+      // failure as "you can never create another loan".
+      const occupied = new Set(Array.from({ length: 8 }, (_, i) => i));
+      const { connection } = createProbeConnection(occupied);
+
+      await expect(
+        findNextMarketNonce(connection, borrower, programId, { maxProbe: 8n, batchSize: 8 })
+      ).rejects.toThrow(/maxProbe=8\b[\s\S]*larger maxProbe or a minNonce above 8\b/);
+    });
+
+    it('rejects a negative maxProbe as invalid input, not as an empty window', async () => {
+      // A `=== 0n` guard would let -1n through: `probeEnd` lands below the
+      // floor, the loop body never runs, and the caller gets a nonsensical
+      // "searched [0, -1)" report instead of being told the option is invalid.
+      const { connection, getMultipleAccountsInfo } = createProbeConnection(new Set());
+
+      await expect(
+        findNextMarketNonce(connection, borrower, programId, { maxProbe: -1n })
+      ).rejects.toThrow(/Invalid maxProbe: -1\b/);
+
+      expect(getMultipleAccountsInfo).not.toHaveBeenCalled();
     });
   });
 });
